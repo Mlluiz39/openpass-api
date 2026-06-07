@@ -1,0 +1,7 @@
+bin/
+backups/
+data/
+server.log
+*.exe
+*.db
+*.secret
