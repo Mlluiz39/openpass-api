@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/openpass/api/internal/admin"
@@ -26,7 +31,12 @@ func main() {
 		log.Printf("OPENPASS_ADMIN_PASSWORD not set; temporary admin password: %s", cfg.AdminPassword)
 	}
 
-	database, err := opdb.Open(cfg.DatabasePath)
+	var database *sql.DB
+	if cfg.DatabaseURL != "" {
+		database, err = opdb.OpenPostgres(cfg.DatabaseURL)
+	} else {
+		database, err = opdb.Open(cfg.DatabasePath)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -59,8 +69,29 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("OpenPass API + CRM panel listening on %s", cfg.Addr)
-	log.Fatal(server.ListenAndServe())
+	errChan := make(chan error, 1)
+	go func() {
+		log.Printf("OpenPass API + CRM panel listening on %s", cfg.Addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errChan <- err
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case err := <-errChan:
+		log.Fatal(err)
+	case <-stop:
+		log.Printf("Shutdown signal received, draining connections...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Forced shutdown: %v", err)
+		}
+		log.Printf("Server stopped")
+	}
 }
 
 func registerBackupRoutes(mux *http.ServeMux, backups *backup.Service, keys *apikeys.Service) {

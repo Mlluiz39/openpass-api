@@ -29,6 +29,9 @@ func TestOpenAndMigrateCreatesCoreTables(t *testing.T) {
 }
 
 func TestOpenEnablesForeignKeys(t *testing.T) {
+	if !UsingSQLite {
+		t.Skip("SQLite-specific test")
+	}
 	database, err := Open(":memory:")
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)

@@ -1,7 +1,21 @@
+# Binaries
 bin/
-backups/
-data/
-server.log
+openpass-server
 *.exe
+
+# Logs
+*.log
+
+# Runtime data
+data/
+backups/
 *.db
 *.secret
+*.opbackup
+
+# Release artifacts (use GitHub Releases instead)
+release/
+
+# Obsolete prototypes / recursive copies
+nested/
+openpass-api/

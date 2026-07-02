@@ -11,6 +11,7 @@ import (
 type Config struct {
 	Addr                   string
 	DatabasePath           string
+	DatabaseURL            string
 	SecretFile             string
 	SecretKey              string
 	AdminPassword          string
@@ -21,6 +22,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		Addr:         envOr("OPENPASS_ADDR", ":8080"),
 		DatabasePath: envOr("OPENPASS_DB_PATH", filepath.Join("data", "openpass.db")),
+		DatabaseURL:  strings.TrimSpace(os.Getenv("OPENPASS_DATABASE_URL")),
 		SecretFile:   envOr("OPENPASS_SECRET_FILE", filepath.Join("data", "openpass.secret")),
 		SecretKey:    strings.TrimSpace(os.Getenv("OPENPASS_SECRET_KEY")),
 	}
