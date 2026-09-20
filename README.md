@@ -5,7 +5,7 @@ OpenPass is a self-hosted secret manager for agents, automations, and DevOps scr
 This version is intentionally simple:
 
 - One Go binary serves the API and the CRM-style web panel.
-- SQLite (default) or PostgreSQL stores local data in `data/openpass.db`.
+- SQLite stores local data in `data/openpass.db`.
 - API keys and secret values are encrypted at rest.
 - API keys can be revealed and copied again from the admin panel.
 - External callers authenticate with `Authorization: Bearer op_live_...`.
@@ -33,19 +33,9 @@ go test ./...
 go build -o bin/openpass-api ./cmd/server
 ```
 
-## PostgreSQL
-
-Set `OPENPASS_DATABASE_URL` to use PostgreSQL instead of SQLite:
-
-```bash
-export OPENPASS_DATABASE_URL='postgres://user:password@localhost:5432/openpass?sslmode=disable'
-```
-
-When this env var is set, `OPENPASS_DB_PATH` is ignored. The schema is created automatically on startup. Migrate existing data via backup/restore.
-
 ## Production Notes
 
-- Persist and back up `data/` (SQLite) or your PostgreSQL database (if using PG).
+- Persist `data/`, which contains the SQLite database and app key.
 - Set `OPENPASS_ADMIN_PASSWORD` outside the repository.
 - Keep `OPENPASS_SECRET_KEY` or `data/openpass.secret` stable.
 - Put Nginx, Caddy, Cloudflare Tunnel, or another HTTPS layer in front of the service.
@@ -94,3 +84,23 @@ The panel has a Backup tab for `.opbackup` files.
 - Restore needs the same password or the same app secret.
 - The backup is a logical JSON snapshot encrypted with AES-GCM.
 - Keep both `data/openpass.db` and `data/openpass.secret` backed up for normal VPS operations.
+
+The original app secret is also required to decrypt the secret values and API
+keys inside a restored snapshot, **even when the backup has a password**. Keep
+that key in a separate safe place; a backup password only protects the outer file.
+
+## Download backups to your device
+
+Open **Backup → Baixar backup neste dispositivo** to download an encrypted
+`.opbackup` file through the browser. On a computer or phone, choose the download
+location or save it through the browser's file controls. Even when OpenPass runs
+on a VPS, the download goes to the device accessing the panel.
+
+You are responsible for keeping the file and sending it to any storage service
+you prefer. No Google account, OAuth configuration or cloud integration is needed.
+There are no automatic cloud uploads. Local backup history records exports and
+restores; it does not contain a downloadable copy of each exported file.
+
+To restore, choose the downloaded file in **Restaurar backup** and enter its
+password if one was used. Keep the original app key separately, as explained
+above: it is still needed to decrypt the restored secrets and API keys.

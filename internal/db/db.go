@@ -4,15 +4,9 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
-	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
-
-// UsingSQLite is true when the active database driver is SQLite.
-// Set automatically by Open / OpenSQLite.
-var UsingSQLite = true
 
 const CoreSchema = `
 CREATE TABLE IF NOT EXISTS admin_sessions (
@@ -98,12 +92,6 @@ CREATE INDEX IF NOT EXISTS idx_audit_ip ON api_audit_logs(ip_address);
 `
 
 func Open(path string) (*sql.DB, error) {
-	return OpenSQLite(path)
-}
-
-func OpenSQLite(path string) (*sql.DB, error) {
-	UsingSQLite = true
-
 	if path != ":memory:" {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return nil, err
@@ -121,28 +109,9 @@ func OpenSQLite(path string) (*sql.DB, error) {
 	return database, nil
 }
 
-func OpenPostgres(databaseURL string) (*sql.DB, error) {
-	UsingSQLite = false
-
-	database, err := sql.Open("pgx", databaseURL)
-	if err != nil {
-		return nil, err
-	}
-	if err := database.Ping(); err != nil {
-		_ = database.Close()
-		return nil, err
-	}
-	database.SetMaxOpenConns(25)
-	database.SetMaxIdleConns(5)
-	database.SetConnMaxLifetime(5 * time.Minute)
-	return database, nil
-}
-
 func Migrate(database *sql.DB, schema string) error {
-	if UsingSQLite {
-		if err := resetEmptyLegacySchema(database); err != nil {
-			return err
-		}
+	if err := resetEmptyLegacySchema(database); err != nil {
+		return err
 	}
 	_, err := database.Exec(schema)
 	return err

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -31,12 +30,7 @@ func main() {
 		log.Printf("OPENPASS_ADMIN_PASSWORD not set; temporary admin password: %s", cfg.AdminPassword)
 	}
 
-	var database *sql.DB
-	if cfg.DatabaseURL != "" {
-		database, err = opdb.OpenPostgres(cfg.DatabaseURL)
-	} else {
-		database, err = opdb.Open(cfg.DatabasePath)
-	}
+	database, err := opdb.Open(cfg.DatabasePath)
 	if err != nil {
 		log.Fatal(err)
 	}

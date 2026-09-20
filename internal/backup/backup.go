@@ -320,33 +320,6 @@ func normalizeValue(value any) any {
 }
 
 func tableColumns(ctx context.Context, tx *sql.Tx, table string) ([]string, error) {
-	cols, err := tableColumnsInfoSchema(ctx, tx, table)
-	if err == nil && len(cols) > 0 {
-		return cols, nil
-	}
-	return tableColumnsPRAGMA(ctx, tx, table)
-}
-
-func tableColumnsInfoSchema(ctx context.Context, tx *sql.Tx, table string) ([]string, error) {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT column_name FROM information_schema.columns
-		 WHERE table_name = ? ORDER BY ordinal_position`, table)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var columns []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		columns = append(columns, name)
-	}
-	return columns, rows.Err()
-}
-
-func tableColumnsPRAGMA(ctx context.Context, tx *sql.Tx, table string) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, "PRAGMA table_info("+table+")")
 	if err != nil {
 		return nil, err

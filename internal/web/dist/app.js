@@ -160,12 +160,12 @@ function renderShell() {
       <aside class="sidebar" id="sideMenu">
         <div class="brand"><span class="mark-box">OP</span> OpenPass</div>
         <nav class="nav">
-          ${navButton("dashboard", "Dashboard", "01")}
-          ${navButton("keys", "API Keys", "02")}
-          ${navButton("vaults", "Cofres", "03")}
-          ${navButton("entries", "Secrets", "04")}
-          ${navButton("backup", "Backup", "05")}
-          ${navButton("logs", "Logs", "06")}
+          ${navButton("dashboard", "Dashboard")}
+          ${navButton("keys", "API Keys", state.keys.length)}
+          ${navButton("vaults", "Cofres", state.vaults.length)}
+          ${navButton("entries", "Secrets", state.entries.length)}
+          ${navButton("backup", "Backup", state.backups.length, "Backups no histórico exibido")}
+          ${navButton("logs", "Logs", state.logs.length, "Logs carregados")}
         </nav>
         <div class="sidebar-tools">
           <button class="theme-button" id="themeBtn" type="button"><span>Tema</span><b>${state.theme === "dark" ? "Dark" : "Light"}</b></button>
@@ -200,8 +200,8 @@ function renderShell() {
   renderView();
 }
 
-function navButton(view, label, code) {
-  return `<button class="${state.view === view ? "active" : ""}" data-view="${view}"><span>${label}</span><b>${code}</b></button>`;
+function navButton(view, label, count = null, countLabel = `Quantidade de ${label}`) {
+  return `<button class="${state.view === view ? "active" : ""}" data-view="${view}"><span>${label}</span>${count === null ? "" : `<b title="${escapeHTML(countLabel)}">${count}</b>`}</button>`;
 }
 
 function renderView() {
@@ -296,11 +296,11 @@ function keysTable() {
             <td>${escapeHTML(key.last_used_at || "sem uso")}</td>
             <td>
               <div class="actions">
-                <button class="btn blue" data-reveal-key="${key.id}">Revelar</button>
+                <button class="btn blue" data-reveal-key="${key.id}" aria-expanded="${isRevealed(key.id)}">${isRevealed(key.id) ? "Esconder" : "Revelar"}</button>
                 <button class="btn ghost" data-revoke-key="${key.id}">Revogar</button>
                 <button class="btn red" data-delete-key="${key.id}">Excluir</button>
               </div>
-              ${state.revealed[key.id] ? `<div class="secret-box mono">${escapeHTML(state.revealed[key.id])}<br><button class="btn ghost" data-copy="${key.id}">Copiar</button></div>` : ""}
+              ${isRevealed(key.id) ? `<div class="secret-box mono">${escapeHTML(state.revealed[key.id])}<br><button class="btn ghost" data-copy="${key.id}">Copiar</button></div>` : ""}
             </td>
           </tr>
         `).join("") || `<tr><td colspan="6">Nenhuma key criada.</td></tr>`}
@@ -331,11 +331,26 @@ async function createKey(event) {
   renderShell();
 }
 
+function isRevealed(id) {
+  return Object.prototype.hasOwnProperty.call(state.revealed, id);
+}
+
 async function revealKey(event) {
   const id = event.currentTarget.dataset.revealKey;
-  const data = await api(`/api/admin/keys/${id}/reveal`);
-  state.revealed[id] = data.token;
-  renderShell();
+  if (isRevealed(id)) {
+    delete state.revealed[id];
+    renderShell();
+    return;
+  }
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const data = await api(`/api/admin/keys/${id}/reveal`);
+    state.revealed[id] = data.token;
+    renderShell();
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function revokeKey(event) {
@@ -453,10 +468,10 @@ function entryRow(entry) {
       <td>${(entry.tags || []).map((tag) => `<span class="badge">${escapeHTML(tag)}</span>`).join(" ")}</td>
       <td>
         <div class="actions">
-          <button class="btn blue" data-reveal-entry="${entry.id}">Revelar</button>
+          <button class="btn blue" data-reveal-entry="${entry.id}" aria-expanded="${isRevealed(entry.id)}">${isRevealed(entry.id) ? "Esconder" : "Revelar"}</button>
           <button class="btn red" data-delete-entry="${entry.id}">Excluir</button>
         </div>
-        ${state.revealed[entry.id] ? `<div class="secret-box mono">${escapeHTML(state.revealed[entry.id])}<br><button class="btn ghost" data-copy="${entry.id}">Copiar</button></div>` : ""}
+        ${isRevealed(entry.id) ? `<div class="secret-box mono">${escapeHTML(state.revealed[entry.id])}<br><button class="btn ghost" data-copy="${entry.id}">Copiar</button></div>` : ""}
       </td>
     </tr>
   `;
@@ -481,9 +496,20 @@ async function createEntry(event) {
 
 async function revealEntry(event) {
   const id = event.currentTarget.dataset.revealEntry;
-  const data = await api(`/api/admin/entries/${id}/reveal`);
-  state.revealed[id] = data.value;
-  renderShell();
+  if (isRevealed(id)) {
+    delete state.revealed[id];
+    renderShell();
+    return;
+  }
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const data = await api(`/api/admin/entries/${id}/reveal`);
+    state.revealed[id] = data.value;
+    renderShell();
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function deleteEntry(event) {
@@ -498,11 +524,13 @@ function renderBackup() {
     ${state.message ? `<p class="notice">${state.message}</p>` : ""}
     <section class="grid backup-grid">
       <div class="panel">
-        <div class="panel-head"><div class="panel-title">Gerar backup</div></div>
+        <div class="panel-head"><div class="panel-title">Salvar no computador ou celular</div></div>
         <form class="form-grid compact-form" id="backupExportForm">
           <label class="span-2">Senha opcional<input type="password" name="password" autocomplete="new-password" placeholder="vazio usa a chave do app" /></label>
-          <div class="span-4 backup-note">Use uma senha se quiser restaurar em outra maquina sem depender do arquivo <span class="mono">data/openpass.secret</span>.</div>
-          <button class="btn green" type="submit">Baixar .opbackup</button>
+          <div class="span-4 backup-note">Guarde a chave original do OpenPass separadamente. Ela é necessária para ler os segredos restaurados, mesmo usando uma senha no backup.</div>
+          <div class="span-4 backup-note">O navegador baixa o arquivo criptografado neste dispositivo. Depois, você pode guardá-lo ou enviá-lo para onde preferir.</div>
+          <button class="btn green" type="submit">Baixar backup neste dispositivo</button>
+          <div class="span-4 error" id="backupExportError" role="alert" hidden></div>
         </form>
       </div>
       <div class="panel">
@@ -552,29 +580,44 @@ function renderBackup() {
 
 async function exportBackup(event) {
   event.preventDefault();
-  const data = new FormData(event.currentTarget);
-  const res = await fetch("/api/admin/backup/export", {
-    method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password: data.get("password") }),
-  });
-  if (!res.ok) {
-    throw new Error("backup_export_failed");
+  const form = event.currentTarget;
+  const data = new FormData(form);
+  const button = form.querySelector('[type="submit"]');
+  const errorBox = form.querySelector("#backupExportError");
+  button.disabled = true;
+  button.textContent = "Gerando backup…";
+  errorBox.hidden = true;
+  try {
+    const res = await fetch("/api/admin/backup/export", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: data.get("password") }),
+    });
+    if (!res.ok) throw new Error("Não foi possível gerar o backup. Tente novamente.");
+    const blob = await res.blob();
+    const disposition = res.headers.get("Content-Disposition") || "";
+    const match = disposition.match(/filename="([^"]+)"/);
+    const filename = match ? match[1] : "openpass-backup.opbackup";
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    // Allow the browser to start reading the file before releasing the URL.
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    state.message = "Download iniciado. Confira os downloads ou a opção de salvar arquivo do navegador e guarde o backup onde preferir.";
+    await loadAll();
+    renderShell();
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.hidden = false;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Baixar backup neste dispositivo";
   }
-  const blob = await res.blob();
-  const disposition = res.headers.get("Content-Disposition") || "";
-  const match = disposition.match(/filename="([^"]+)"/);
-  const filename = match ? match[1] : "openpass-backup.opbackup";
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(url);
-  state.message = "Backup criptografado gerado e baixado.";
-  await loadAll();
-  renderShell();
 }
 
 async function restoreBackup(event) {
