@@ -19,6 +19,10 @@ fi
 
 mkdir -p bin data backups
 
+echo "[0/3] Stopping any running OpenPass instance..."
+pkill -f "bin/openpass-api" 2>/dev/null || true
+sleep 1
+
 echo "[1/3] Running tests..."
 go test ./...
 
