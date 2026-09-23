@@ -9,11 +9,15 @@ const state = {
   revealed: {},
   copiedKey: null,
   expanded: {},
-  modal: null, // { mode: 'create' | 'edit', item?: Entry, selectedType?: string }
+  modal: null, // { mode: 'create' | 'edit', item?: Entry, selectedType?: string, form?: object }
   backupModalOpen: false,
   securityModalOpen: false,
   recoveryKey: null,
   recoveryView: false,
+  installPrompt: null,
+  canInstall: false,
+  installed: false,
+  showIosHint: false,
   toast: null,
 };
 
@@ -141,6 +145,9 @@ function generateStrongPassword(length = 20) {
 }
 
 async function boot() {
+  registerServiceWorker();
+  initPwaInstall();
+  initGlobalShortcuts();
   try {
     await api("/api/admin/me");
     await loadData();
@@ -148,6 +155,87 @@ async function boot() {
   } catch {
     renderLogin();
   }
+}
+
+function openNewItemModal() {
+  state.modal = {
+    mode: "create",
+    selectedType: state.activeCategory === "all" ? "login" : state.activeCategory,
+    form: null,
+  };
+  render();
+}
+
+// ---------------------------------------------------------------- PWA wiring
+
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  // Service workers require a secure context: https, or localhost for local use.
+  if (!window.isSecureContext) {
+    console.info("OpenPass: service worker skipped (a secure context is required).");
+    return;
+  }
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch((err) => {
+      console.warn("OpenPass: service worker registration failed", err);
+    });
+  });
+}
+
+function initPwaInstall() {
+  // Chromium fires this when the manifest, icons and service worker qualify.
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    state.installPrompt = event;
+    state.canInstall = true;
+    if (document.querySelector("#btnInstall")) render();
+  });
+
+  window.addEventListener("appinstalled", () => {
+    state.installPrompt = null;
+    state.canInstall = false;
+    state.installed = true;
+    showToast("OpenPass instalado como aplicativo!");
+    render();
+  });
+
+  // Already running as an installed app?
+  if (window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true) {
+    state.installed = true;
+  }
+
+  // iOS never fires beforeinstallprompt, so the button would never appear there.
+  const isIos = /iphone|ipad|ipod/i.test(window.navigator.userAgent);
+  if (isIos && !state.installed) {
+    state.showIosHint = true;
+  }
+}
+
+async function promptInstall() {
+  if (state.installPrompt) {
+    state.installPrompt.prompt();
+    const choice = await state.installPrompt.userChoice;
+    if (choice?.outcome === "accepted") {
+      state.installPrompt = null;
+      state.canInstall = false;
+      render();
+    }
+    return;
+  }
+  if (state.showIosHint) {
+    alert(
+      "Para instalar no iPhone/iPad:\n\n" +
+        "1. Toque no botão Compartilhar do Safari\n" +
+        "2. Escolha \"Adicionar à Tela de Início\"\n" +
+        "3. Confirme em \"Adicionar\""
+    );
+    return;
+  }
+  alert(
+    "Seu navegador não ofereceu a instalação automática.\n\n" +
+      "No Chrome/Edge use o menu ⋮ → \"Instalar OpenPass\".\n" +
+      "A instalação exige HTTPS (ou localhost)."
+  );
 }
 
 async function loadData() {
@@ -302,8 +390,49 @@ function renderLogin(error = "") {
   });
 }
 
+// render() replaces the whole shell, which destroys and recreates every input.
+// Any value the user is still typing would be lost, so the focused field and
+// the open modal's form are captured first and restored afterwards.
+function captureFocus() {
+  const el = document.activeElement;
+  if (!el || !el.id || !app.contains(el)) return null;
+  const snapshot = { id: el.id };
+  if (typeof el.selectionStart === "number") {
+    snapshot.start = el.selectionStart;
+    snapshot.end = el.selectionEnd;
+  }
+  return snapshot;
+}
+
+function restoreFocus(snapshot) {
+  if (!snapshot) return;
+  const el = document.getElementById(snapshot.id);
+  if (!el || typeof el.focus !== "function") return;
+  el.focus({ preventScroll: true });
+  if (typeof snapshot.start === "number" && typeof el.setSelectionRange === "function") {
+    try {
+      el.setSelectionRange(snapshot.start, snapshot.end);
+    } catch {
+      /* not a text field */
+    }
+  }
+}
+
+function snapshotItemForm() {
+  if (!state.modal) return;
+  const form = document.querySelector("#itemForm");
+  if (!form) return;
+  const values = {};
+  new FormData(form).forEach((value, key) => {
+    values[key] = value;
+  });
+  state.modal.form = values;
+}
+
 function render() {
+  snapshotItemForm();
   const filtered = filterEntries();
+  const focusSnapshot = captureFocus();
 
   app.innerHTML = `
     <header class="header">
@@ -317,6 +446,11 @@ function render() {
           <button class="btn btn-primary btn-new-desktop" id="btnNewItem">
             <span>+</span> Novo Registro
           </button>
+          ${state.canInstall ? `
+            <button class="btn btn-ghost btn-install" id="btnInstall" title="Instalar o OpenPass como aplicativo">
+              <span>⬇️</span> <span class="hide-mobile">Instalar app</span>
+            </button>
+          ` : ""}
           <button class="btn btn-ghost" id="btnSecurity" title="Alterar senha e chave de recuperação">
             <span>⚙️</span> <span class="hide-mobile">Segurança</span>
           </button>
@@ -361,7 +495,7 @@ function render() {
       }).join("")}
     </div>
 
-    <main class="main-content">
+    <main class="main-content" id="resultsContainer">
       ${filtered.length === 0 ? renderEmptyState() : `
         <div class="items-grid">
           ${filtered.map(renderCard).join("")}
@@ -379,6 +513,56 @@ function render() {
   `;
 
   attachEvents();
+  restoreFocus(focusSnapshot);
+}
+
+// Search and category pills only change the result list. Repainting the whole
+// shell on every keystroke used to destroy the open modal and drop focus.
+function renderResults() {
+  const container = document.querySelector("#resultsContainer");
+  if (!container) {
+    render();
+    return;
+  }
+  const filtered = filterEntries();
+  container.innerHTML = filtered.length === 0
+    ? renderEmptyState()
+    : `<div class="items-grid">${filtered.map(renderCard).join("")}</div>`;
+  attachResultEvents();
+  syncSearchClearButton();
+  syncCategoryPills();
+}
+
+function syncSearchClearButton() {
+  const bar = document.querySelector(".search-bar");
+  if (!bar) return;
+  const existing = document.querySelector("#searchClear");
+  if (state.searchQuery && !existing) {
+    const btn = document.createElement("button");
+    btn.className = "search-clear";
+    btn.id = "searchClear";
+    btn.type = "button";
+    btn.textContent = "✕";
+    btn.addEventListener("click", () => {
+      state.searchQuery = "";
+      const input = document.querySelector("#searchInput");
+      if (input) input.value = "";
+      renderResults();
+      input?.focus();
+    });
+    bar.appendChild(btn);
+  } else if (!state.searchQuery && existing) {
+    existing.remove();
+  }
+}
+
+function syncCategoryPills() {
+  document.querySelectorAll("[data-category]").forEach((btn) => {
+    const catId = btn.dataset.category;
+    btn.classList.toggle("active", catId === state.activeCategory);
+    const badge = btn.querySelector(".pill-badge");
+    if (badge) badge.textContent = String(getCategoryCount(catId));
+  });
 }
 
 function getCategoryCount(catId) {
@@ -578,6 +762,13 @@ function renderItemModal() {
   const currentType = selectedType || (item ? item.type : "login");
   const isEdit = mode === "edit";
   const meta = (item && item.metadata) || {};
+  // Values the user already typed win over the stored ones, so switching the
+  // credential type or any incidental repaint no longer clears the form.
+  const typed = state.modal.form || {};
+  const field = (name, fallback = "") => {
+    if (Object.prototype.hasOwnProperty.call(typed, name)) return typed[name];
+    return fallback;
+  };
 
   return `
     <div class="modal-overlay" id="modalBackdrop">
@@ -616,23 +807,23 @@ function renderItemModal() {
               currentType === "email" ? "Ex: Gmail Pessoal, Outlook Empresa" :
               currentType === "apikey" ? "Ex: OpenAI GPT, Stripe Prod, AWS" :
               currentType === "note" ? "Ex: Chaves de Recuperação, Frase Secreta" : "Ex: Netflix, Amazon, Mercado Livre"
-            }" value="${escapeHTML(item ? item.path : "")}" />
+            }" value="${escapeHTML(field("path", item ? item.path : ""))}" />
           </div>
 
           ${currentType === "login" ? `
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label">Usuário ou Login</label>
-                <input class="form-input" name="meta_username" placeholder="seu.usuario" value="${escapeHTML(meta.username || "")}" />
+                <input class="form-input" name="meta_username" placeholder="seu.usuario" value="${escapeHTML(field("meta_username", meta.username || ""))}" />
               </div>
               <div class="form-group">
                 <label class="form-label">E-mail associado</label>
-                <input class="form-input" name="meta_email" type="email" placeholder="seu@email.com" value="${escapeHTML(meta.email || "")}" />
+                <input class="form-input" name="meta_email" type="email" placeholder="seu@email.com" value="${escapeHTML(field("meta_email", meta.email || ""))}" />
               </div>
             </div>
             <div class="form-group">
               <label class="form-label">Endereço do Site (URL)</label>
-              <input class="form-input" name="meta_url" placeholder="https://exemplo.com/login" value="${escapeHTML(meta.url || "")}" />
+              <input class="form-input" name="meta_url" placeholder="https://exemplo.com/login" value="${escapeHTML(field("meta_url", meta.url || ""))}" />
             </div>
           ` : ""}
 
@@ -640,21 +831,21 @@ function renderItemModal() {
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label">Agência</label>
-                <input class="form-input" name="meta_agency" placeholder="0001" value="${escapeHTML(meta.agency || "")}" />
+                <input class="form-input" name="meta_agency" placeholder="0001" value="${escapeHTML(field("meta_agency", meta.agency || ""))}" />
               </div>
               <div class="form-group">
                 <label class="form-label">Conta com Dígito</label>
-                <input class="form-input" name="meta_account" placeholder="123456-7" value="${escapeHTML(meta.account || "")}" />
+                <input class="form-input" name="meta_account" placeholder="123456-7" value="${escapeHTML(field("meta_account", meta.account || ""))}" />
               </div>
             </div>
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label">Chave Pix</label>
-                <input class="form-input" name="meta_pix" placeholder="CPF, e-mail ou aleatória" value="${escapeHTML(meta.pix || "")}" />
+                <input class="form-input" name="meta_pix" placeholder="CPF, e-mail ou aleatória" value="${escapeHTML(field("meta_pix", meta.pix || ""))}" />
               </div>
               <div class="form-group">
                 <label class="form-label">Senha de Transação / Cartão</label>
-                <input class="form-input" type="password" name="meta_secondary" placeholder="Opcional" value="${escapeHTML(meta.secondary || "")}" />
+                <input class="form-input" type="password" name="meta_secondary" placeholder="Opcional" value="${escapeHTML(field("meta_secondary", meta.secondary || ""))}" />
               </div>
             </div>
           ` : ""}
@@ -662,11 +853,11 @@ function renderItemModal() {
           ${currentType === "email" ? `
             <div class="form-group">
               <label class="form-label">Endereço de E-mail</label>
-              <input class="form-input" name="meta_email" type="email" required placeholder="contato@gmail.com" value="${escapeHTML(meta.email || "")}" />
+              <input class="form-input" name="meta_email" type="email" required placeholder="contato@gmail.com" value="${escapeHTML(field("meta_email", meta.email || ""))}" />
             </div>
             <div class="form-group">
               <label class="form-label">E-mail ou Tel. de Recuperação</label>
-              <input class="form-input" name="meta_recovery" placeholder="backup@email.com ou (11) 9..." value="${escapeHTML(meta.recovery || "")}" />
+              <input class="form-input" name="meta_recovery" placeholder="backup@email.com ou (11) 9..." value="${escapeHTML(field("meta_recovery", meta.recovery || ""))}" />
             </div>
           ` : ""}
 
@@ -674,16 +865,16 @@ function renderItemModal() {
             <div class="form-row">
               <div class="form-group">
                 <label class="form-label">Plataforma</label>
-                <input class="form-input" name="meta_platform" placeholder="OpenAI, Anthropic, GitHub..." value="${escapeHTML(meta.platform || "")}" />
+                <input class="form-input" name="meta_platform" placeholder="OpenAI, Anthropic, GitHub..." value="${escapeHTML(field("meta_platform", meta.platform || ""))}" />
               </div>
               <div class="form-group">
                 <label class="form-label">Link Docs / Dashboard</label>
-                <input class="form-input" name="meta_url" placeholder="https://platform.openai.com" value="${escapeHTML(meta.url || "")}" />
+                <input class="form-input" name="meta_url" placeholder="https://platform.openai.com" value="${escapeHTML(field("meta_url", meta.url || ""))}" />
               </div>
             </div>
             <div class="form-group">
               <label class="form-label">Secret / Chave Secundária (opcional)</label>
-              <input class="form-input" name="meta_secret" placeholder="API Secret" value="${escapeHTML(meta.secret || "")}" />
+              <input class="form-input" name="meta_secret" placeholder="API Secret" value="${escapeHTML(field("meta_secret", meta.secret || ""))}" />
             </div>
           ` : ""}
 
@@ -694,10 +885,10 @@ function renderItemModal() {
               ${isEdit ? '<span style="font-weight:normal;font-size:12px;color:var(--text-dim)">(vazio para manter)</span>' : ""}
             </label>
             ${currentType === "note" ? `
-              <textarea class="form-textarea" name="value" placeholder="Digite sua nota confidencial..." ${isEdit ? "" : "required"}>${isEdit && state.revealed[item.id] ? escapeHTML(state.revealed[item.id]) : ""}</textarea>
+              <textarea class="form-textarea" name="value" placeholder="Digite sua nota confidencial..." ${isEdit ? "" : "required"}>${escapeHTML(field("value", isEdit && item && state.revealed[item.id] ? state.revealed[item.id] : ""))}</textarea>
             ` : `
               <div class="password-input-wrap">
-                <input class="form-input" id="modalPasswordInput" type="password" name="value" placeholder="${isEdit ? "••••••••••••" : "Digite ou gere uma senha forte"}" ${isEdit ? "" : "required"} />
+                <input class="form-input" id="modalPasswordInput" type="password" name="value" placeholder="${isEdit ? "••••••••••••" : "Digite ou gere uma senha forte"}" value="${escapeHTML(field("value", ""))}" ${isEdit ? "" : "required"} />
                 <div class="password-tools">
                   <button type="button" class="pass-tool-btn" id="btnTogglePassVisibility" title="Ver / Ocultar">👁️</button>
                   <button type="button" class="pass-tool-btn" id="btnGeneratePass" title="Gerar senha forte">🎲 Gerar</button>
@@ -708,7 +899,7 @@ function renderItemModal() {
 
           <div class="form-group">
             <label class="form-label">Anotações extras (opcional)</label>
-            <textarea class="form-textarea" name="meta_notes" placeholder="Informações adicionais, dicas de segurança...">${escapeHTML(meta.notes || "")}</textarea>
+            <textarea class="form-textarea" name="meta_notes" placeholder="Informações adicionais, dicas de segurança...">${escapeHTML(field("meta_notes", meta.notes || ""))}</textarea>
           </div>
         </form>
 
@@ -842,64 +1033,60 @@ function renderBackupModal() {
   `;
 }
 
-function attachEvents() {
-  document.querySelector("#btnTheme")?.addEventListener("click", toggleTheme);
-  
-  document.querySelector("#btnLogout")?.addEventListener("click", async () => {
-    await api("/api/admin/logout", { method: "POST", body: "{}" });
-    renderLogin();
+// Closing on "click" alone also fires when a text selection starts inside the
+// modal and ends over the backdrop, which silently discarded a half-typed
+// record. Only a press that both starts and ends on the backdrop closes it.
+function bindOverlayClose(selector, onClose) {
+  const overlay = document.querySelector(selector);
+  if (!overlay) return;
+  let armed = false;
+  overlay.addEventListener("pointerdown", (e) => {
+    armed = e.target === overlay;
   });
-
-  const openNewItemModal = () => {
-    state.modal = { mode: "create", selectedType: state.activeCategory === "all" ? "login" : state.activeCategory };
-    render();
-  };
-
-  document.querySelector("#btnNewItem")?.addEventListener("click", openNewItemModal);
-  document.querySelector("#fabNewItem")?.addEventListener("click", openNewItemModal);
-  document.querySelector("#emptyBtnNew")?.addEventListener("click", openNewItemModal);
-
-  document.querySelector("#btnBackup")?.addEventListener("click", () => {
-    state.backupModalOpen = true;
-    render();
+  overlay.addEventListener("click", (e) => {
+    if (armed && e.target === overlay) onClose();
+    armed = false;
   });
+}
 
-  document.querySelector("#btnSecurity")?.addEventListener("click", async () => {
-    state.securityModalOpen = true;
+function closeTopModal() {
+  if (state.modal) {
+    state.modal = null;
     render();
-    try {
-      const res = await api("/api/admin/recovery-key");
-      state.recoveryKey = res.recovery_key;
-      const displayEl = document.querySelector("#displayRecoveryKey");
-      if (displayEl) displayEl.textContent = state.recoveryKey;
-    } catch (err) {
-      console.error(err);
+    return true;
+  }
+  if (state.securityModalOpen) {
+    state.securityModalOpen = false;
+    render();
+    return true;
+  }
+  if (state.backupModalOpen) {
+    state.backupModalOpen = false;
+    render();
+    return true;
+  }
+  return false;
+}
+
+function initGlobalShortcuts() {
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && closeTopModal()) {
+      event.preventDefault();
+      return;
+    }
+    // Ctrl/Cmd+Enter saves the record without reaching for the mouse.
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && state.modal) {
+      const form = document.querySelector("#itemForm");
+      if (form) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
     }
   });
+}
 
-  // Search input live filtering
-  const searchInput = document.querySelector("#searchInput");
-  if (searchInput) {
-    searchInput.focus();
-    searchInput.setSelectionRange(searchInput.value.length, searchInput.value.length);
-    searchInput.addEventListener("input", (e) => {
-      state.searchQuery = e.target.value;
-      render();
-    });
-  }
-
-  document.querySelector("#searchClear")?.addEventListener("click", () => {
-    state.searchQuery = "";
-    render();
-  });
-
-  // Category pills
-  document.querySelectorAll("[data-category]").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      state.activeCategory = e.currentTarget.dataset.category;
-      render();
-    });
-  });
+function attachResultEvents() {
+  document.querySelector("#emptyBtnNew")?.addEventListener("click", openNewItemModal);
 
   // Quick Copy Secret (Password / Token)
   document.querySelectorAll("[data-copy-secret]").forEach((btn) => {
@@ -969,7 +1156,7 @@ function attachEvents() {
           state.revealed[id] = res.value;
         } catch {}
       }
-      state.modal = { mode: "edit", item, selectedType: item.type };
+      state.modal = { mode: "edit", item, selectedType: item.type, form: null };
       render();
     });
   });
@@ -990,6 +1177,57 @@ function attachEvents() {
       }
     });
   });
+}
+
+function attachEvents() {
+  document.querySelector("#btnTheme")?.addEventListener("click", toggleTheme);
+  
+  document.querySelector("#btnLogout")?.addEventListener("click", async () => {
+    await api("/api/admin/logout", { method: "POST", body: "{}" });
+    renderLogin();
+  });
+
+  document.querySelector("#btnNewItem")?.addEventListener("click", openNewItemModal);
+  document.querySelector("#fabNewItem")?.addEventListener("click", openNewItemModal);
+
+  document.querySelector("#btnInstall")?.addEventListener("click", promptInstall);
+
+  document.querySelector("#btnBackup")?.addEventListener("click", () => {
+    state.backupModalOpen = true;
+    render();
+  });
+
+  document.querySelector("#btnSecurity")?.addEventListener("click", async () => {
+    state.securityModalOpen = true;
+    render();
+    try {
+      const res = await api("/api/admin/recovery-key");
+      state.recoveryKey = res.recovery_key;
+      const displayEl = document.querySelector("#displayRecoveryKey");
+      if (displayEl) displayEl.textContent = state.recoveryKey;
+    } catch (err) {
+      console.error(err);
+    }
+  });
+
+  // Search and category filters repaint only the result list, so the open modal
+  // and the caret in this input survive.
+  const searchInput = document.querySelector("#searchInput");
+  if (searchInput) {
+    searchInput.addEventListener("input", (e) => {
+      state.searchQuery = e.target.value;
+      renderResults();
+    });
+  }
+
+  document.querySelectorAll("[data-category]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      state.activeCategory = e.currentTarget.dataset.category;
+      renderResults();
+    });
+  });
+
+  attachResultEvents();
 
   // Item Modal events
   if (state.modal) {
@@ -999,7 +1237,7 @@ function attachEvents() {
     };
     document.querySelector("#modalClose")?.addEventListener("click", closeModal);
     document.querySelector("#modalCancel")?.addEventListener("click", closeModal);
-    document.querySelector("#modalBackdrop")?.addEventListener("click", closeModal);
+    bindOverlayClose("#modalBackdrop", closeModal);
 
     document.querySelectorAll("[data-modal-type]").forEach((btn) => {
       btn.addEventListener("click", (e) => {
@@ -1082,7 +1320,7 @@ function attachEvents() {
     };
     document.querySelector("#securityModalClose")?.addEventListener("click", closeSecurity);
     document.querySelector("#securityModalCancel")?.addEventListener("click", closeSecurity);
-    document.querySelector("#securityModalBackdrop")?.addEventListener("click", closeSecurity);
+    bindOverlayClose("#securityModalBackdrop", closeSecurity);
 
     document.querySelector("#btnToggleNewPass")?.addEventListener("click", () => {
       const el = document.querySelector("#newPassInput");
@@ -1158,7 +1396,7 @@ function attachEvents() {
     };
     document.querySelector("#backupModalClose")?.addEventListener("click", closeBackup);
     document.querySelector("#backupModalCancel")?.addEventListener("click", closeBackup);
-    document.querySelector("#backupModalBackdrop")?.addEventListener("click", closeBackup);
+    bindOverlayClose("#backupModalBackdrop", closeBackup);
 
     document.querySelector("#exportForm")?.addEventListener("submit", async (e) => {
       e.preventDefault();

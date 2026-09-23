@@ -26,6 +26,39 @@ http://127.0.0.1:8080/
 If `OPENPASS_SECRET_KEY` is not set, the app creates `data/openpass.secret`.
 Keep that file safe. It is required to decrypt saved API keys and secrets.
 
+### Forgot the password?
+
+The panel password is stored (hashed) in the database, so changing
+`OPENPASS_ADMIN_PASSWORD` alone does nothing once a password has been saved.
+To force the configured password back, run once with the reset flag:
+
+```bash
+OPENPASS_ADMIN_PASSWORD='new-password' OPENPASS_ADMIN_PASSWORD_RESET=1 ./bin/openpass-api
+```
+
+This replaces the stored password and invalidates every existing session. Unset
+`OPENPASS_ADMIN_PASSWORD_RESET` afterwards.
+
+You can also use the recovery key shown in **⚙️ Segurança**: on the login screen
+click **Esqueci minha senha** and paste it.
+
+## Install as an app (PWA)
+
+OpenPass ships a web manifest and a service worker, so it can be installed like
+a native app:
+
+- **Android / Chrome / Edge:** an **Instalar app** button appears in the header,
+  or use the browser menu → "Instalar OpenPass".
+- **iPhone / iPad:** Safari → Share → "Adicionar à Tela de Início".
+- **Desktop:** the install icon in the address bar.
+
+Installation requires a **secure context**: HTTPS, or `localhost`. Over plain
+HTTP on a remote host the browser will not offer it — terminate TLS in front of
+the service (Nginx, Caddy or Cloudflare Tunnel).
+
+The service worker uses network-first for the app shell with a cached offline
+fallback. It never intercepts `/api/`, so secrets are always fetched live.
+
 ## Build
 
 ```bash

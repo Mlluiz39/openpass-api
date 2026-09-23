@@ -236,6 +236,18 @@ button, input, select, textarea {
   background: var(--danger-light);
 }
 
+/* Install-as-app call to action */
+.btn-install {
+  background: var(--accent-light);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-install:hover {
+  background: var(--accent);
+  color: #ffffff;
+}
+
 /* Search Bar */
 .search-container {
   max-width: 1200px;
@@ -924,6 +936,25 @@ button, input, select, textarea {
 
   .brand-badge {
     display: none;
+  }
+
+  /* The header carries a lot of actions; on a phone only the icon remains. */
+  .hide-mobile {
+    display: none;
+  }
+
+  .header-actions {
+    gap: 6px;
+  }
+
+  .header-actions .btn {
+    padding: 8px 10px;
+  }
+
+  .btn-install {
+    background: var(--accent-light);
+    border-color: var(--accent);
+    color: var(--accent);
   }
   
   .mobile-fab {
