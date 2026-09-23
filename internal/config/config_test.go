@@ -58,3 +58,53 @@ func TestLoadGeneratesTemporaryAdminPasswordWhenMissing(t *testing.T) {
 		t.Fatalf("generated admin password too short")
 	}
 }
+
+func TestLoadParsesResetFlag(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("OPENPASS_DB_PATH", filepath.Join(dir, "openpass.db"))
+	t.Setenv("OPENPASS_SECRET_FILE", filepath.Join(dir, "openpass.secret"))
+	t.Setenv("OPENPASS_SECRET_KEY", "local-secret")
+	t.Setenv("OPENPASS_ADMIN_PASSWORD", "admin-pass")
+	t.Setenv("OPENPASS_ADMIN_PASSWORD_RESET", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.ResetAdminPassword {
+		t.Fatalf("ResetAdminPassword = false, want true for \"true\"")
+	}
+
+	for _, value := range []string{"1", "TRUE", "yes", "on"} {
+		t.Setenv("OPENPASS_ADMIN_PASSWORD_RESET", value)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with %q error = %v", value, err)
+		}
+		if !cfg.ResetAdminPassword {
+			t.Fatalf("ResetAdminPassword = false for %q, want true", value)
+		}
+	}
+
+	t.Setenv("OPENPASS_ADMIN_PASSWORD_RESET", "0")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ResetAdminPassword {
+		t.Fatalf("ResetAdminPassword = true for \"0\", want false")
+	}
+}
+
+func TestLoadRejectsResetWithoutPassword(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("OPENPASS_DB_PATH", filepath.Join(dir, "openpass.db"))
+	t.Setenv("OPENPASS_SECRET_FILE", filepath.Join(dir, "openpass.secret"))
+	t.Setenv("OPENPASS_SECRET_KEY", "local-secret")
+	t.Setenv("OPENPASS_ADMIN_PASSWORD", "")
+	t.Setenv("OPENPASS_ADMIN_PASSWORD_RESET", "1")
+
+	if _, err := Load(); err == nil {
+		t.Fatalf("Load() error = nil, want error when reset is set without a password")
+	}
+}

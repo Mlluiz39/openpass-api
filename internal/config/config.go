@@ -3,6 +3,7 @@ package config
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ type Config struct {
 	SecretKey              string
 	AdminPassword          string
 	GeneratedAdminPassword bool
+	ResetAdminPassword     bool
 }
 
 func Load() (Config, error) {
@@ -33,8 +35,13 @@ func Load() (Config, error) {
 		cfg.SecretKey = key
 	}
 
+	cfg.ResetAdminPassword = isTruthy(os.Getenv("OPENPASS_ADMIN_PASSWORD_RESET"))
+
 	cfg.AdminPassword = strings.TrimSpace(os.Getenv("OPENPASS_ADMIN_PASSWORD"))
 	if cfg.AdminPassword == "" {
+		if cfg.ResetAdminPassword {
+			return Config{}, errors.New("OPENPASS_ADMIN_PASSWORD_RESET requires OPENPASS_ADMIN_PASSWORD to be set")
+		}
 		password, err := randomHex(12)
 		if err != nil {
 			return Config{}, err
@@ -44,6 +51,15 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func isTruthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func envOr(key, fallback string) string {

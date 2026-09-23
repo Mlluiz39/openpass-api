@@ -19,10 +19,15 @@ import (
 const CookieName = "openpass_session"
 
 type Service struct {
-	db            *sql.DB
-	box           secure.Box
-	adminPassword string
-	sessionTTL    time.Duration
+	db *sql.DB
+	box secure.Box
+	// configuredPassword is the password supplied at startup (env var or a
+	// generated temporary one). It stays immutable for the lifetime of the
+	// process: the database is the source of truth for the *current* password,
+	// and configuredPassword is only the fallback used to bootstrap and to
+	// restore access via ResetPassword.
+	configuredPassword string
+	sessionTTL         time.Duration
 }
 
 func New(database *sql.DB, adminPassword string, secretKey ...string) *Service {
@@ -31,13 +36,25 @@ func New(database *sql.DB, adminPassword string, secretKey ...string) *Service {
 		sec = secretKey[0]
 	}
 	s := &Service{
-		db:            database,
-		box:           secure.NewBox(sec),
-		adminPassword: adminPassword,
-		sessionTTL:    12 * time.Hour,
+		db:                 database,
+		box:                secure.NewBox(sec),
+		configuredPassword: adminPassword,
+		sessionTTL:         12 * time.Hour,
 	}
 	_ = s.ensureSettings()
 	return s
+}
+
+// ResetPassword overwrites the stored admin password with the one currently
+// configured, discarding any password previously set through the panel. It is
+// used by OPENPASS_ADMIN_PASSWORD_RESET so an operator can always regain access
+// from the CLI without editing the database by hand.
+func (s *Service) ResetPassword() error {
+	if err := s.setNewPassword(s.configuredPassword); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM admin_sessions`)
+	return err
 }
 
 func (s *Service) RegisterRoutes(mux *http.ServeMux) {
@@ -58,7 +75,7 @@ func (s *Service) ensureSettings() error {
 		if err != nil {
 			return err
 		}
-		passHash := secure.SHA256Hex(salt + ":" + s.adminPassword)
+		passHash := secure.SHA256Hex(salt + ":" + s.configuredPassword)
 		_, err = s.db.Exec(`INSERT OR REPLACE INTO app_settings(key, value) VALUES('admin_password_salt', ?), ('admin_password_hash', ?)`, salt, passHash)
 		if err != nil {
 			return err
@@ -102,12 +119,22 @@ func (s *Service) generateAndSaveRecoveryKey() (string, error) {
 	return key, nil
 }
 
+// normalizeRecoveryKey reduces a recovery key to its 16-character body so the
+// same key is accepted whether the user pastes it formatted
+// (OP-REC-ABCD-EFGH-JKLM-NPQR), lowercased, or stripped of every separator.
+// Separators are removed *before* the OP-REC prefix is stripped, otherwise an
+// input without dashes would keep the prefix glued to the body and never match.
 func normalizeRecoveryKey(key string) string {
-	k := strings.ToUpper(strings.TrimSpace(key))
-	k = strings.TrimPrefix(k, "OP-REC-")
-	k = strings.TrimPrefix(k, "OP-")
-	k = strings.ReplaceAll(k, "-", "")
-	k = strings.ReplaceAll(k, " ", "")
+	var b strings.Builder
+	for _, r := range strings.ToUpper(strings.TrimSpace(key)) {
+		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') {
+			b.WriteRune(r)
+		}
+	}
+	// The body alphabet excludes "O", so trimming these prefixes can never eat
+	// part of the body itself.
+	k := strings.TrimPrefix(b.String(), "OPREC")
+	k = strings.TrimPrefix(k, "OP")
 	return k
 }
 
@@ -121,7 +148,7 @@ func (s *Service) verifyPassword(password string) bool {
 			return secure.VerifySHA256(salt+":"+password, hash)
 		}
 	}
-	return sameSecret(password, s.adminPassword)
+	return sameSecret(password, s.configuredPassword)
 }
 
 func (s *Service) setNewPassword(newPassword string) error {
@@ -138,7 +165,6 @@ func (s *Service) setNewPassword(newPassword string) error {
 	if err != nil {
 		return err
 	}
-	s.adminPassword = newPassword
 	return nil
 }
 

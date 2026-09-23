@@ -167,6 +167,99 @@ func TestRecoveryKeyFlow(t *testing.T) {
 	}
 }
 
+func TestNormalizeRecoveryKeyAcceptsCommonFormats(t *testing.T) {
+	const body = "5DRR992HJABKLS4C"
+	formatted := "OP-REC-5DRR-992H-JABK-LS4C"
+	for _, input := range []string{
+		formatted,
+		strings.ToLower(formatted),
+		body,
+		strings.ToLower(body),
+		"op rec 5drr 992h jabk ls4c",
+		"  OP-REC-5DRR-992H-JABK-LS4C  ",
+	} {
+		if got := normalizeRecoveryKey(input); got != body {
+			t.Fatalf("normalizeRecoveryKey(%q) = %q, want %q", input, got, body)
+		}
+	}
+}
+
+func TestRecoveryKeyAcceptsUnformattedInput(t *testing.T) {
+	database := testDB(t)
+	service := New(database, "initial-pass")
+
+	key, err := service.generateAndSaveRecoveryKey()
+	if err != nil {
+		t.Fatalf("generateAndSaveRecoveryKey() error = %v", err)
+	}
+
+	// A user pasting the key without separators or in lowercase must still work.
+	flattened := strings.ToLower(strings.ReplaceAll(key, "-", ""))
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/recover-password",
+		strings.NewReader(`{"recovery_key":"`+flattened+`","new_password":"recovered-pass"}`))
+	rec := httptest.NewRecorder()
+	service.RecoverPassword(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for unformatted key; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResetPasswordRestoresConfiguredPassword(t *testing.T) {
+	database := testDB(t)
+	service := New(database, "configured-pass")
+
+	// Simulate a password changed from the panel.
+	if err := service.setNewPassword("panel-chosen-pass"); err != nil {
+		t.Fatalf("setNewPassword() error = %v", err)
+	}
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/admin/login", strings.NewReader(`{"password":"configured-pass"}`))
+	loginRec := httptest.NewRecorder()
+	service.Login(loginRec, loginReq)
+	if loginRec.Code != http.StatusUnauthorized {
+		t.Fatalf("configured pass after panel change = %d, want 401", loginRec.Code)
+	}
+
+	if err := service.ResetPassword(); err != nil {
+		t.Fatalf("ResetPassword() error = %v", err)
+	}
+
+	loginReq = httptest.NewRequest(http.MethodPost, "/api/admin/login", strings.NewReader(`{"password":"configured-pass"}`))
+	loginRec = httptest.NewRecorder()
+	service.Login(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("configured pass after reset = %d, want 200; body=%s", loginRec.Code, loginRec.Body.String())
+	}
+
+	// The panel-chosen password must no longer work.
+	loginReq = httptest.NewRequest(http.MethodPost, "/api/admin/login", strings.NewReader(`{"password":"panel-chosen-pass"}`))
+	loginRec = httptest.NewRecorder()
+	service.Login(loginRec, loginReq)
+	if loginRec.Code != http.StatusUnauthorized {
+		t.Fatalf("old panel pass after reset = %d, want 401", loginRec.Code)
+	}
+}
+
+func TestResetPasswordDropsExistingSessions(t *testing.T) {
+	database := testDB(t)
+	service := New(database, "admin-pass")
+	cookie := loginCookie(t, service)
+
+	if err := service.ResetPassword(); err != nil {
+		t.Fatalf("ResetPassword() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/me", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	service.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("session after reset = %d, want 401", rec.Code)
+	}
+}
+
 func loginCookie(t *testing.T, service *Service) *http.Cookie {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/login", strings.NewReader(`{"password":"admin-pass"}`))

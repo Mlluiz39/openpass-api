@@ -40,6 +40,12 @@ func main() {
 	}
 
 	adminSvc := admin.New(database, cfg.AdminPassword, cfg.SecretKey)
+	if cfg.ResetAdminPassword {
+		if err := adminSvc.ResetPassword(); err != nil {
+			log.Fatalf("failed to reset admin password: %v", err)
+		}
+		log.Printf("OPENPASS_ADMIN_PASSWORD_RESET set; admin password replaced by OPENPASS_ADMIN_PASSWORD")
+	}
 	auditSvc := audit.New(database)
 	keySvc := apikeys.New(database, cfg.SecretKey)
 	keySvc.SetAudit(auditSvc)
