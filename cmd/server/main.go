@@ -39,7 +39,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	adminSvc := admin.New(database, cfg.AdminPassword)
+	adminSvc := admin.New(database, cfg.AdminPassword, cfg.SecretKey)
 	auditSvc := audit.New(database)
 	keySvc := apikeys.New(database, cfg.SecretKey)
 	keySvc.SetAudit(auditSvc)

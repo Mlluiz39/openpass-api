@@ -6,7 +6,10 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/openpass/api/internal/httpjson"
@@ -17,46 +20,136 @@ const CookieName = "openpass_session"
 
 type Service struct {
 	db            *sql.DB
+	box           secure.Box
 	adminPassword string
 	sessionTTL    time.Duration
 }
 
-func New(database *sql.DB, adminPassword string) *Service {
-	return &Service{
+func New(database *sql.DB, adminPassword string, secretKey ...string) *Service {
+	sec := adminPassword
+	if len(secretKey) > 0 && strings.TrimSpace(secretKey[0]) != "" {
+		sec = secretKey[0]
+	}
+	s := &Service{
 		db:            database,
+		box:           secure.NewBox(sec),
 		adminPassword: adminPassword,
 		sessionTTL:    12 * time.Hour,
 	}
+	_ = s.ensureSettings()
+	return s
 }
 
 func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/admin/login", s.Login)
 	mux.Handle("POST /api/admin/logout", s.Require(http.HandlerFunc(s.Logout)))
 	mux.Handle("GET /api/admin/me", s.Require(http.HandlerFunc(s.Me)))
+	mux.Handle("POST /api/admin/change-password", s.Require(http.HandlerFunc(s.ChangePassword)))
+	mux.Handle("GET /api/admin/recovery-key", s.Require(http.HandlerFunc(s.GetRecoveryKey)))
+	mux.Handle("POST /api/admin/regenerate-recovery-key", s.Require(http.HandlerFunc(s.RegenerateRecoveryKey)))
+	mux.HandleFunc("POST /api/admin/recover-password", s.RecoverPassword)
 }
 
-func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Password string `json:"password"`
-	}
-	if err := httpjson.Decode(r, &body); err != nil {
-		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
-		return
-	}
-	if !sameSecret(body.Password, s.adminPassword) {
-		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
-		return
+func (s *Service) ensureSettings() error {
+	var hash string
+	err := s.db.QueryRow(`SELECT value FROM app_settings WHERE key = 'admin_password_hash'`).Scan(&hash)
+	if err == sql.ErrNoRows {
+		salt, err := randomHex(16)
+		if err != nil {
+			return err
+		}
+		passHash := secure.SHA256Hex(salt + ":" + s.adminPassword)
+		_, err = s.db.Exec(`INSERT OR REPLACE INTO app_settings(key, value) VALUES('admin_password_salt', ?), ('admin_password_hash', ?)`, salt, passHash)
+		if err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
 	}
 
+	var recEnc string
+	err = s.db.QueryRow(`SELECT value FROM app_settings WHERE key = 'recovery_key_enc'`).Scan(&recEnc)
+	if err == sql.ErrNoRows {
+		_, err = s.generateAndSaveRecoveryKey()
+		if err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) generateAndSaveRecoveryKey() (string, error) {
+	const chars = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	for i := range b {
+		b[i] = chars[int(b[i])%len(chars)]
+	}
+	key := fmt.Sprintf("OP-REC-%s-%s-%s-%s", b[0:4], b[4:8], b[8:12], b[12:16])
+	enc, err := s.box.EncryptString(key)
+	if err != nil {
+		return "", err
+	}
+	normHash := secure.SHA256Hex(normalizeRecoveryKey(key))
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO app_settings(key, value) VALUES('recovery_key_enc', ?), ('recovery_key_hash', ?)`, enc, normHash)
+	if err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+func normalizeRecoveryKey(key string) string {
+	k := strings.ToUpper(strings.TrimSpace(key))
+	k = strings.TrimPrefix(k, "OP-REC-")
+	k = strings.TrimPrefix(k, "OP-")
+	k = strings.ReplaceAll(k, "-", "")
+	k = strings.ReplaceAll(k, " ", "")
+	return k
+}
+
+func (s *Service) verifyPassword(password string) bool {
+	_ = s.ensureSettings()
+	var salt, hash string
+	err := s.db.QueryRow(`SELECT value FROM app_settings WHERE key = 'admin_password_salt'`).Scan(&salt)
+	if err == nil {
+		err = s.db.QueryRow(`SELECT value FROM app_settings WHERE key = 'admin_password_hash'`).Scan(&hash)
+		if err == nil && salt != "" && hash != "" {
+			return secure.VerifySHA256(salt+":"+password, hash)
+		}
+	}
+	return sameSecret(password, s.adminPassword)
+}
+
+func (s *Service) setNewPassword(newPassword string) error {
+	newPassword = strings.TrimSpace(newPassword)
+	if len(newPassword) < 6 {
+		return errors.New("a nova senha deve ter pelo menos 6 caracteres")
+	}
+	salt, err := randomHex(16)
+	if err != nil {
+		return err
+	}
+	passHash := secure.SHA256Hex(salt + ":" + newPassword)
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO app_settings(key, value) VALUES('admin_password_salt', ?), ('admin_password_hash', ?)`, salt, passHash)
+	if err != nil {
+		return err
+	}
+	s.adminPassword = newPassword
+	return nil
+}
+
+func (s *Service) createSession(w http.ResponseWriter) error {
 	token, err := randomHex(32)
 	if err != nil {
-		httpjson.Error(w, http.StatusInternalServerError, "session_error")
-		return
+		return err
 	}
 	id, err := randomHex(16)
 	if err != nil {
-		httpjson.Error(w, http.StatusInternalServerError, "session_error")
-		return
+		return err
 	}
 	expires := time.Now().UTC().Add(s.sessionTTL)
 	if _, err := s.db.Exec(
@@ -65,8 +158,7 @@ func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 		secure.SHA256Hex(token),
 		expires.Format(time.RFC3339),
 	); err != nil {
-		httpjson.Error(w, http.StatusInternalServerError, "session_error")
-		return
+		return err
 	}
 
 	http.SetCookie(w, &http.Cookie{
@@ -78,6 +170,26 @@ func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(s.sessionTTL.Seconds()),
 		Expires:  expires,
 	})
+	return nil
+}
+
+func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := httpjson.Decode(r, &body); err != nil {
+		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
+		return
+	}
+	if !s.verifyPassword(body.Password) {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if err := s.createSession(w); err != nil {
+		httpjson.Error(w, http.StatusInternalServerError, "session_error")
+		return
+	}
 	httpjson.Write(w, http.StatusOK, map[string]any{"authenticated": true})
 }
 
@@ -99,6 +211,116 @@ func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) Me(w http.ResponseWriter, r *http.Request) {
 	httpjson.Write(w, http.StatusOK, map[string]any{"authenticated": true})
+}
+
+func (s *Service) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := httpjson.Decode(r, &body); err != nil {
+		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
+		return
+	}
+	if !s.verifyPassword(body.CurrentPassword) {
+		httpjson.Error(w, http.StatusBadRequest, "senha_atual_incorreta")
+		return
+	}
+	if err := s.setNewPassword(body.NewPassword); err != nil {
+		httpjson.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	httpjson.Write(w, http.StatusOK, map[string]any{"success": true})
+}
+
+func (s *Service) GetRecoveryKey(w http.ResponseWriter, r *http.Request) {
+	_ = s.ensureSettings()
+	var enc string
+	err := s.db.QueryRowContext(r.Context(), `SELECT value FROM app_settings WHERE key = 'recovery_key_enc'`).Scan(&enc)
+	if err != nil {
+		key, err := s.generateAndSaveRecoveryKey()
+		if err != nil {
+			httpjson.Error(w, http.StatusInternalServerError, "recovery_key_error")
+			return
+		}
+		httpjson.Write(w, http.StatusOK, map[string]string{"recovery_key": key})
+		return
+	}
+	key, err := s.box.DecryptString(enc)
+	if err != nil {
+		key, err = s.generateAndSaveRecoveryKey()
+		if err != nil {
+			httpjson.Error(w, http.StatusInternalServerError, "recovery_key_error")
+			return
+		}
+	}
+	httpjson.Write(w, http.StatusOK, map[string]string{"recovery_key": key})
+}
+
+func (s *Service) RegenerateRecoveryKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := httpjson.Decode(r, &body); err != nil {
+		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
+		return
+	}
+	if !s.verifyPassword(body.Password) {
+		httpjson.Error(w, http.StatusUnauthorized, "senha_incorreta")
+		return
+	}
+	key, err := s.generateAndSaveRecoveryKey()
+	if err != nil {
+		httpjson.Error(w, http.StatusInternalServerError, "error_generating_recovery_key")
+		return
+	}
+	httpjson.Write(w, http.StatusOK, map[string]string{"recovery_key": key})
+}
+
+func (s *Service) RecoverPassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RecoveryKey string `json:"recovery_key"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := httpjson.Decode(r, &body); err != nil {
+		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
+		return
+	}
+	_ = s.ensureSettings()
+	var storedHash string
+	err := s.db.QueryRowContext(r.Context(), `SELECT value FROM app_settings WHERE key = 'recovery_key_hash'`).Scan(&storedHash)
+	if err != nil {
+		httpjson.Error(w, http.StatusBadRequest, "chave_de_recuperacao_invalida")
+		return
+	}
+	inputNorm := normalizeRecoveryKey(body.RecoveryKey)
+	if inputNorm == "" || !secure.VerifySHA256(inputNorm, storedHash) {
+		httpjson.Error(w, http.StatusUnauthorized, "chave_de_recuperacao_invalida")
+		return
+	}
+
+	if err := s.setNewPassword(body.NewPassword); err != nil {
+		httpjson.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	newKey, err := s.generateAndSaveRecoveryKey()
+	if err != nil {
+		httpjson.Error(w, http.StatusInternalServerError, "error_rotating_recovery_key")
+		return
+	}
+
+	_, _ = s.db.ExecContext(r.Context(), `DELETE FROM admin_sessions`)
+
+	if err := s.createSession(w); err != nil {
+		httpjson.Error(w, http.StatusInternalServerError, "session_error")
+		return
+	}
+
+	httpjson.Write(w, http.StatusOK, map[string]any{
+		"recovered":        true,
+		"new_recovery_key": newKey,
+	})
 }
 
 func (s *Service) Require(next http.Handler) http.Handler {

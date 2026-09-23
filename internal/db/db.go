@@ -89,6 +89,12 @@ CREATE INDEX IF NOT EXISTS idx_entries_vault ON entries(vault_id);
 CREATE INDEX IF NOT EXISTS idx_audit_key_id ON api_audit_logs(api_key_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON api_audit_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_ip ON api_audit_logs(ip_address);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 `
 
 func Open(path string) (*sql.DB, error) {

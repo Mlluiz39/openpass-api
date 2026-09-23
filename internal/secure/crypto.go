@@ -22,7 +22,7 @@ type APIKey struct {
 }
 
 func GenerateAPIKey(env string) (APIKey, error) {
-	if env != "live" && env != "test" {
+	if env != "live" && env != "test" && env != "" && env != "none" && env != "raw" {
 		return APIKey{}, fmt.Errorf("unsupported key env: %s", env)
 	}
 	raw := make([]byte, 24)
@@ -30,21 +30,37 @@ func GenerateAPIKey(env string) (APIKey, error) {
 		return APIKey{}, err
 	}
 	token := hex.EncodeToString(raw)
-	plaintext := fmt.Sprintf("op_%s_%s", env, token)
+	plaintext := token
+	if env == "live" || env == "test" {
+		plaintext = fmt.Sprintf("op_%s_%s", env, token)
+	}
+	return NewAPIKey(plaintext)
+}
+
+func NewAPIKey(plaintext string) (APIKey, error) {
+	plaintext = strings.TrimSpace(plaintext)
+	if len(plaintext) < 8 {
+		return APIKey{}, errors.New("key must be at least 8 characters")
+	}
+	suffix := plaintext
+	if len(suffix) > 4 {
+		suffix = suffix[len(suffix)-4:]
+	}
 	return APIKey{
 		Plaintext: plaintext,
 		Prefix:    ExtractPrefix(plaintext),
-		Suffix:    plaintext[len(plaintext)-4:],
+		Suffix:    suffix,
 		Hash:      SHA256Hex(plaintext),
 	}, nil
 }
 
 func ExtractPrefix(token string) string {
-	if !(strings.HasPrefix(token, "op_live_") || strings.HasPrefix(token, "op_test_")) {
+	token = strings.TrimSpace(token)
+	if len(token) < 8 {
 		return ""
 	}
 	if len(token) < 16 {
-		return ""
+		return token
 	}
 	return token[:16]
 }

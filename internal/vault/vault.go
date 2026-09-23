@@ -133,8 +133,26 @@ func (s *Service) ListVaults(ctx context.Context, key *apikeys.AuthenticatedKey)
 }
 
 func (s *Service) CreateEntry(ctx context.Context, input EntryInput) (Entry, error) {
-	if strings.TrimSpace(input.VaultID) == "" || strings.TrimSpace(input.Path) == "" || strings.TrimSpace(input.Type) == "" {
-		return Entry{}, errors.New("vault_id, path and type required")
+	path := strings.TrimSpace(input.Path)
+	if path == "" {
+		return Entry{}, errors.New("path required")
+	}
+	entryType := strings.TrimSpace(input.Type)
+	if entryType == "" {
+		entryType = "login"
+	}
+	vaultID := strings.TrimSpace(input.VaultID)
+	if vaultID == "" {
+		err := s.db.QueryRowContext(ctx, `SELECT id FROM vaults ORDER BY created_at ASC LIMIT 1`).Scan(&vaultID)
+		if err == sql.ErrNoRows {
+			v, err := s.CreateVault(ctx, VaultInput{Name: "Principal", Description: "Cofre principal"})
+			if err != nil {
+				return Entry{}, err
+			}
+			vaultID = v.ID
+		} else if err != nil {
+			return Entry{}, err
+		}
 	}
 	id, err := randomID()
 	if err != nil {
@@ -153,17 +171,24 @@ func (s *Service) CreateEntry(ctx context.Context, input EntryInput) (Entry, err
 		return Entry{}, err
 	}
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO entries(id, vault_id, path, type, encrypted_value, metadata, tags) VALUES(?,?,?,?,?,?,?)`,
-		id, input.VaultID, strings.TrimSpace(input.Path), strings.TrimSpace(input.Type), encrypted, metadata, tags,
+		id, vaultID, path, entryType, encrypted, metadata, tags,
 	); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return Entry{}, errors.New("já existe um item com este nome")
+		}
 		return Entry{}, err
 	}
 	return s.getEntry(ctx, id)
 }
 
 func (s *Service) UpdateEntry(ctx context.Context, id string, input EntryInput) (Entry, error) {
-	encrypted, err := s.box.EncryptString(input.Value)
-	if err != nil {
-		return Entry{}, err
+	path := strings.TrimSpace(input.Path)
+	if path == "" {
+		return Entry{}, errors.New("path required")
+	}
+	entryType := strings.TrimSpace(input.Type)
+	if entryType == "" {
+		entryType = "login"
 	}
 	metadata, err := marshalOptionalObject(input.Metadata)
 	if err != nil {
@@ -173,10 +198,25 @@ func (s *Service) UpdateEntry(ctx context.Context, id string, input EntryInput) 
 	if err != nil {
 		return Entry{}, err
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE entries SET path = ?, type = ?, encrypted_value = ?, metadata = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		strings.TrimSpace(input.Path), strings.TrimSpace(input.Type), encrypted, metadata, tags, id,
-	)
+
+	var res sql.Result
+	if strings.TrimSpace(input.Value) != "" {
+		encrypted, err := s.box.EncryptString(input.Value)
+		if err != nil {
+			return Entry{}, err
+		}
+		res, err = s.db.ExecContext(ctx, `UPDATE entries SET path = ?, type = ?, encrypted_value = ?, metadata = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			path, entryType, encrypted, metadata, tags, id,
+		)
+	} else {
+		res, err = s.db.ExecContext(ctx, `UPDATE entries SET path = ?, type = ?, metadata = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			path, entryType, metadata, tags, id,
+		)
+	}
 	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return Entry{}, errors.New("já existe um item com este nome")
+		}
 		return Entry{}, err
 	}
 	affected, _ := res.RowsAffected()

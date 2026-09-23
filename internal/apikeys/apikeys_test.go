@@ -66,6 +66,74 @@ func TestCreateRevealAndAuthenticateKey(t *testing.T) {
 	}
 }
 
+func TestCreateKeyWithoutPrefixAndAuthenticate(t *testing.T) {
+	database := testDB(t)
+	service := New(database, "secret")
+
+	created, err := service.Create(context.Background(), CreateInput{
+		Name:        "Raw Hex Key",
+		Env:         "none",
+		Permissions: map[string]bool{"vaults:read": true},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if len(created.Token) != 48 {
+		t.Fatalf("Token length = %d, want 48 hex chars", len(created.Token))
+	}
+	if created.KeyPrefix != created.Token[:16] {
+		t.Fatalf("KeyPrefix = %q, want %q", created.KeyPrefix, created.Token[:16])
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/vaults", nil)
+	req.Header.Set("Authorization", "Bearer "+created.Token)
+	req.RemoteAddr = "203.0.113.7:4444"
+	auth, status, err := service.Authenticate(req, "vaults:read")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("Authenticate() status=%d err=%v", status, err)
+	}
+	if auth.ID != created.ID {
+		t.Fatalf("authenticated key id = %q, want %q", auth.ID, created.ID)
+	}
+}
+
+func TestCreateKeyWithCustomTokenAndAuthenticate(t *testing.T) {
+	database := testDB(t)
+	service := New(database, "secret")
+
+	customToken := "my-secret-agent-api-token-custom"
+	created, err := service.Create(context.Background(), CreateInput{
+		Name:        "Custom Key",
+		Token:       customToken,
+		Permissions: map[string]bool{"vaults:read": true},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if created.Token != customToken {
+		t.Fatalf("Token = %q, want %q", created.Token, customToken)
+	}
+
+	revealed, err := service.Reveal(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Reveal() error = %v", err)
+	}
+	if revealed != customToken {
+		t.Fatalf("Reveal() = %q, want %q", revealed, customToken)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/vaults", nil)
+	req.Header.Set("Authorization", "Bearer "+customToken)
+	req.RemoteAddr = "203.0.113.7:4444"
+	auth, status, err := service.Authenticate(req, "vaults:read")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("Authenticate() status=%d err=%v", status, err)
+	}
+	if auth.ID != created.ID {
+		t.Fatalf("authenticated key id = %q, want %q", auth.ID, created.ID)
+	}
+}
+
 func TestRevokedKeyCannotAuthenticate(t *testing.T) {
 	database := testDB(t)
 	service := New(database, "secret")

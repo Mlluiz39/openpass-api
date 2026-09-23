@@ -39,6 +39,7 @@ type CreateInput struct {
 	Name         string          `json:"name"`
 	Description  string          `json:"description"`
 	Env          string          `json:"env"`
+	Token        string          `json:"token,omitempty"`
 	Permissions  map[string]bool `json:"permissions"`
 	AllowedIPs   []string        `json:"allowed_ips"`
 	VaultScope   []string        `json:"vault_scope"`
@@ -112,11 +113,15 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreatedKey, er
 	if strings.TrimSpace(input.Name) == "" {
 		return CreatedKey{}, errors.New("name required")
 	}
-	env := input.Env
-	if env == "" {
-		env = "live"
+	var generated secure.APIKey
+	var err error
+	customToken := strings.TrimSpace(input.Token)
+	if customToken != "" {
+		generated, err = secure.NewAPIKey(customToken)
+	} else {
+		env := strings.TrimSpace(input.Env)
+		generated, err = secure.GenerateAPIKey(env)
 	}
-	generated, err := secure.GenerateAPIKey(env)
 	if err != nil {
 		return CreatedKey{}, err
 	}
