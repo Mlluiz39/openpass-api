@@ -66,13 +66,68 @@ go test ./...
 go build -o bin/openpass-api ./cmd/server
 ```
 
+## Deploy / update on a VPS
+
+The web panel is compiled into the binary (`go:embed dist/*`), so **a
+`git pull` alone changes nothing** — the running process keeps serving the old
+frontend from the binary it was started with. Always rebuild and restart:
+
+```bash
+cd /opt/openpass-api     # your checkout
+git pull
+./deploy.sh              # tests, rebuilds, restarts (systemd or nohup)
+```
+
+`deploy.sh` detects an `openpass.service` / `openpass-api.service` unit and uses
+`systemctl restart`; with no unit it falls back to `nohup`. Either way it never
+touches `data/`, so your records and app key survive.
+
+After an update, reload the page once with **Ctrl+Shift+R** (or Cmd+Shift+R) to
+drop the previous assets.
+
+### Behind a Cloudflare Tunnel
+
+Point the tunnel at the port OpenPass listens on (`http://localhost:8080` by
+default). Cloudflare terminates TLS, which is what makes the service a secure
+context — and therefore what makes **installing as an app (PWA) possible**.
+Without HTTPS the browser silently refuses both the service worker and the
+install prompt.
+
+- Every response is sent with `Cache-Control: no-store`, so Cloudflare will not
+  cache the panel. If you added a "Cache Everything" page rule, remove it or
+  purge the cache after deploying.
+- Do not put a path prefix in front of the app: the manifest, the service worker
+  and its scope all assume the root (`/`).
+- The recovery key and backup files stay on the server under `data/`; keep that
+  directory in your VPS backups.
+
 ## Production Notes
 
 - Persist `data/`, which contains the SQLite database and app key.
-- Set `OPENPASS_ADMIN_PASSWORD` outside the repository.
+- Set `OPENPASS_ADMIN_PASSWORD` outside the repository (e.g. in `.env`).
 - Keep `OPENPASS_SECRET_KEY` or `data/openpass.secret` stable.
 - Put Nginx, Caddy, Cloudflare Tunnel, or another HTTPS layer in front of the service.
 - Run the binary with `systemd` on a VPS.
+
+Example systemd unit (`/etc/systemd/system/openpass.service`):
+
+```ini
+[Unit]
+Description=OpenPass personal vault
+After=network.target
+
+[Service]
+Type=simple
+User=openpass
+WorkingDirectory=/opt/openpass-api
+EnvironmentFile=/opt/openpass-api/.env
+ExecStart=/opt/openpass-api/bin/openpass-api
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Main Endpoints
 
