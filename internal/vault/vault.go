@@ -7,10 +7,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/openpass/api/internal/admin"
 	"github.com/openpass/api/internal/apikeys"
+	opdb "github.com/openpass/api/internal/db"
 	"github.com/openpass/api/internal/httpjson"
 	"github.com/openpass/api/internal/secure"
 )
@@ -59,7 +63,7 @@ func New(database *sql.DB, secret string) *Service {
 	return &Service{db: database, box: secure.NewBox(secret)}
 }
 
-func (s *Service) CreateVault(ctx context.Context, input VaultInput) (Vault, error) {
+func (s *Service) CreateVault(ctx context.Context, ownerID string, input VaultInput) (Vault, error) {
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
 		return Vault{}, errors.New("name required")
@@ -68,19 +72,22 @@ func (s *Service) CreateVault(ctx context.Context, input VaultInput) (Vault, err
 	if err != nil {
 		return Vault{}, err
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO vaults(id, name, description) VALUES(?,?,?)`, id, name, strings.TrimSpace(input.Description)); err != nil {
+	now := nowRFC3339()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO vaults(id, owner_id, name, description, created_at, updated_at) VALUES($1,$2,$3,$4,$5,$6)`,
+		id, ownerID, name, strings.TrimSpace(input.Description), now, now,
+	); err != nil {
 		return Vault{}, err
 	}
-	return s.getVault(ctx, id)
+	return s.getVault(ctx, ownerID, id)
 }
 
-func (s *Service) UpdateVault(ctx context.Context, id string, input VaultInput) (Vault, error) {
+func (s *Service) UpdateVault(ctx context.Context, ownerID, id string, input VaultInput) (Vault, error) {
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
 		return Vault{}, errors.New("name required")
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE vaults SET name = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		name, strings.TrimSpace(input.Description), id,
+	res, err := s.db.ExecContext(ctx, `UPDATE vaults SET name = $1, description = $2, updated_at = $3 WHERE id = $4 AND owner_id = $5`,
+		name, strings.TrimSpace(input.Description), nowRFC3339(), id, ownerID,
 	)
 	if err != nil {
 		return Vault{}, err
@@ -89,11 +96,11 @@ func (s *Service) UpdateVault(ctx context.Context, id string, input VaultInput) 
 	if affected == 0 {
 		return Vault{}, sql.ErrNoRows
 	}
-	return s.getVault(ctx, id)
+	return s.getVault(ctx, ownerID, id)
 }
 
-func (s *Service) DeleteVault(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM vaults WHERE id = ?`, id)
+func (s *Service) DeleteVault(ctx context.Context, ownerID, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM vaults WHERE id = $1 AND owner_id = $2`, id, ownerID)
 	if err != nil {
 		return err
 	}
@@ -104,16 +111,19 @@ func (s *Service) DeleteVault(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Service) ListVaults(ctx context.Context, key *apikeys.AuthenticatedKey) ([]Vault, error) {
-	query := `SELECT id, name, description, created_at, updated_at FROM vaults`
-	args := []any{}
-	if key != nil && len(key.VaultScope) > 0 {
-		placeholders := make([]string, 0, len(key.VaultScope))
-		for _, id := range key.VaultScope {
-			placeholders = append(placeholders, "?")
+// ListVaults returns the owner's vaults, optionally narrowed to an API key's
+// vault scope. ownerID is always applied first: a key can only ever restrict
+// within its owner's data, never widen it.
+func (s *Service) ListVaults(ctx context.Context, ownerID string, scope []string) ([]Vault, error) {
+	query := `SELECT id, name, description, created_at, updated_at FROM vaults WHERE owner_id = $1`
+	args := []any{ownerID}
+	if len(scope) > 0 {
+		placeholders := make([]string, 0, len(scope))
+		for _, id := range scope {
 			args = append(args, id)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
 		}
-		query += ` WHERE id IN (` + strings.Join(placeholders, ",") + `)`
+		query += ` AND id IN (` + strings.Join(placeholders, ",") + `)`
 	}
 	query += ` ORDER BY updated_at DESC`
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -132,7 +142,7 @@ func (s *Service) ListVaults(ctx context.Context, key *apikeys.AuthenticatedKey)
 	return out, rows.Err()
 }
 
-func (s *Service) CreateEntry(ctx context.Context, input EntryInput) (Entry, error) {
+func (s *Service) CreateEntry(ctx context.Context, ownerID string, input EntryInput) (Entry, error) {
 	path := strings.TrimSpace(input.Path)
 	if path == "" {
 		return Entry{}, errors.New("path required")
@@ -143,9 +153,11 @@ func (s *Service) CreateEntry(ctx context.Context, input EntryInput) (Entry, err
 	}
 	vaultID := strings.TrimSpace(input.VaultID)
 	if vaultID == "" {
-		err := s.db.QueryRowContext(ctx, `SELECT id FROM vaults ORDER BY created_at ASC LIMIT 1`).Scan(&vaultID)
+		// No vault given: fall back to the owner's oldest vault, creating the
+		// default "Principal" vault on first use.
+		err := s.db.QueryRowContext(ctx, `SELECT id FROM vaults WHERE owner_id = $1 ORDER BY created_at ASC LIMIT 1`, ownerID).Scan(&vaultID)
 		if err == sql.ErrNoRows {
-			v, err := s.CreateVault(ctx, VaultInput{Name: "Principal", Description: "Cofre principal"})
+			v, err := s.CreateVault(ctx, ownerID, VaultInput{Name: "Principal", Description: "Cofre principal"})
 			if err != nil {
 				return Entry{}, err
 			}
@@ -153,6 +165,8 @@ func (s *Service) CreateEntry(ctx context.Context, input EntryInput) (Entry, err
 		} else if err != nil {
 			return Entry{}, err
 		}
+	} else if !s.ownsVault(ctx, ownerID, vaultID) {
+		return Entry{}, ErrForbidden
 	}
 	id, err := randomID()
 	if err != nil {
@@ -170,18 +184,19 @@ func (s *Service) CreateEntry(ctx context.Context, input EntryInput) (Entry, err
 	if err != nil {
 		return Entry{}, err
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO entries(id, vault_id, path, type, encrypted_value, metadata, tags) VALUES(?,?,?,?,?,?,?)`,
-		id, vaultID, path, entryType, encrypted, metadata, tags,
+	now := nowRFC3339()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO entries(id, vault_id, path, type, encrypted_value, metadata, tags, created_at, updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		id, vaultID, path, entryType, encrypted, metadata, tags, now, now,
 	); err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if opdb.IsUniqueViolation(err) {
 			return Entry{}, errors.New("já existe um item com este nome")
 		}
 		return Entry{}, err
 	}
-	return s.getEntry(ctx, id)
+	return s.getEntry(ctx, ownerID, id)
 }
 
-func (s *Service) UpdateEntry(ctx context.Context, id string, input EntryInput) (Entry, error) {
+func (s *Service) UpdateEntry(ctx context.Context, ownerID, id string, input EntryInput) (Entry, error) {
 	path := strings.TrimSpace(input.Path)
 	if path == "" {
 		return Entry{}, errors.New("path required")
@@ -199,22 +214,30 @@ func (s *Service) UpdateEntry(ctx context.Context, id string, input EntryInput) 
 		return Entry{}, err
 	}
 
+	// Ownership first: the UPDATE itself is restricted to entries whose vault
+	// belongs to ownerID, so a guessed ID can never be modified cross-user.
 	var res sql.Result
+	now := nowRFC3339()
 	if strings.TrimSpace(input.Value) != "" {
-		encrypted, err := s.box.EncryptString(input.Value)
-		if err != nil {
-			return Entry{}, err
+		// encErr, not err: a := here would shadow the outer err and the
+		// ExecContext failure below would be silently swallowed (and res
+		// would stay nil for RowsAffected).
+		encrypted, encErr := s.box.EncryptString(input.Value)
+		if encErr != nil {
+			return Entry{}, encErr
 		}
-		res, err = s.db.ExecContext(ctx, `UPDATE entries SET path = ?, type = ?, encrypted_value = ?, metadata = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-			path, entryType, encrypted, metadata, tags, id,
+		res, err = s.db.ExecContext(ctx, `UPDATE entries SET path = $1, type = $2, encrypted_value = $3, metadata = $4, tags = $5, updated_at = $6
+			WHERE id = $7 AND vault_id IN (SELECT id FROM vaults WHERE owner_id = $8)`,
+			path, entryType, encrypted, metadata, tags, now, id, ownerID,
 		)
 	} else {
-		res, err = s.db.ExecContext(ctx, `UPDATE entries SET path = ?, type = ?, metadata = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-			path, entryType, metadata, tags, id,
+		res, err = s.db.ExecContext(ctx, `UPDATE entries SET path = $1, type = $2, metadata = $3, tags = $4, updated_at = $5
+			WHERE id = $6 AND vault_id IN (SELECT id FROM vaults WHERE owner_id = $7)`,
+			path, entryType, metadata, tags, now, id, ownerID,
 		)
 	}
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if opdb.IsUniqueViolation(err) {
 			return Entry{}, errors.New("já existe um item com este nome")
 		}
 		return Entry{}, err
@@ -223,11 +246,12 @@ func (s *Service) UpdateEntry(ctx context.Context, id string, input EntryInput) 
 	if affected == 0 {
 		return Entry{}, sql.ErrNoRows
 	}
-	return s.getEntry(ctx, id)
+	return s.getEntry(ctx, ownerID, id)
 }
 
-func (s *Service) DeleteEntry(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM entries WHERE id = ?`, id)
+func (s *Service) DeleteEntry(ctx context.Context, ownerID, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM entries
+		WHERE id = $1 AND vault_id IN (SELECT id FROM vaults WHERE owner_id = $2)`, id, ownerID)
 	if err != nil {
 		return err
 	}
@@ -238,14 +262,39 @@ func (s *Service) DeleteEntry(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Service) ListEntries(ctx context.Context, vaultID string) ([]Entry, error) {
-	query := `SELECT id, vault_id, path, type, metadata, tags, created_at, updated_at FROM entries`
-	args := []any{}
-	if strings.TrimSpace(vaultID) != "" {
-		query += ` WHERE vault_id = ?`
-		args = append(args, vaultID)
+// ListEntries returns the owner's entries, optionally for a single vault.
+func (s *Service) ListEntries(ctx context.Context, ownerID, vaultID string) ([]Entry, error) {
+	return s.listEntries(ctx, ownerID, vaultID, nil)
+}
+
+// ListEntriesForAPI applies the API key's vault scope on top of the key
+// owner's data: an empty scope means "everything the owner has".
+func (s *Service) ListEntriesForAPI(ctx context.Context, key *apikeys.AuthenticatedKey, vaultID string) ([]Entry, error) {
+	if key == nil {
+		return nil, ErrForbidden
 	}
-	query += ` ORDER BY updated_at DESC`
+	if vaultID != "" && !key.CanAccessVault(vaultID) {
+		return nil, ErrForbidden
+	}
+	return s.listEntries(ctx, key.OwnerID, vaultID, key.VaultScope)
+}
+
+func (s *Service) listEntries(ctx context.Context, ownerID, vaultID string, scope []string) ([]Entry, error) {
+	query := `SELECT e.id, e.vault_id, e.path, e.type, e.metadata, e.tags, e.created_at, e.updated_at
+		FROM entries e JOIN vaults v ON v.id = e.vault_id WHERE v.owner_id = $1`
+	args := []any{ownerID}
+	if strings.TrimSpace(vaultID) != "" {
+		args = append(args, vaultID)
+		query += fmt.Sprintf(` AND e.vault_id = $%d`, len(args))
+	} else if len(scope) > 0 {
+		placeholders := make([]string, 0, len(scope))
+		for _, id := range scope {
+			args = append(args, id)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		query += ` AND e.vault_id IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	query += ` ORDER BY e.updated_at DESC`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -262,40 +311,15 @@ func (s *Service) ListEntries(ctx context.Context, vaultID string) ([]Entry, err
 	return out, rows.Err()
 }
 
-func (s *Service) ListEntriesForAPI(ctx context.Context, key *apikeys.AuthenticatedKey, vaultID string) ([]Entry, error) {
-	if key != nil && vaultID != "" && !key.CanAccessVault(vaultID) {
-		return nil, ErrForbidden
-	}
-	if key != nil && vaultID == "" && len(key.VaultScope) > 0 {
-		query := `SELECT id, vault_id, path, type, metadata, tags, created_at, updated_at FROM entries WHERE vault_id IN (`
-		args := []any{}
-		placeholders := make([]string, 0, len(key.VaultScope))
-		for _, id := range key.VaultScope {
-			placeholders = append(placeholders, "?")
-			args = append(args, id)
-		}
-		query += strings.Join(placeholders, ",") + `) ORDER BY updated_at DESC`
-		rows, err := s.db.QueryContext(ctx, query, args...)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		var out []Entry
-		for rows.Next() {
-			entry, err := scanEntry(rows)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, entry)
-		}
-		return out, rows.Err()
-	}
-	return s.ListEntries(ctx, vaultID)
-}
-
-func (s *Service) RevealEntry(ctx context.Context, id string) (string, error) {
+// RevealEntry decrypts an entry's value only when the entry belongs to
+// ownerID; otherwise sql.ErrNoRows is returned (callers map it to 404, so a
+// foreign ID is indistinguishable from a missing one).
+func (s *Service) RevealEntry(ctx context.Context, ownerID, id string) (string, error) {
 	var encrypted string
-	if err := s.db.QueryRowContext(ctx, `SELECT encrypted_value FROM entries WHERE id = ?`, id).Scan(&encrypted); err != nil {
+	err := s.db.QueryRowContext(ctx, `SELECT e.encrypted_value
+		FROM entries e JOIN vaults v ON v.id = e.vault_id
+		WHERE e.id = $1 AND v.owner_id = $2`, id, ownerID).Scan(&encrypted)
+	if err != nil {
 		return "", err
 	}
 	return s.box.DecryptString(encrypted)
@@ -323,8 +347,20 @@ func (s *Service) RegisterAPIRoutes(mux *http.ServeMux, keys *apikeys.Service) {
 	mux.Handle("DELETE /api/v1/entries/{id}", keys.RequirePermission("entries:write", http.HandlerFunc(s.APIDeleteEntry)))
 }
 
+// requestUser returns the session user injected by admin.Require. A missing
+// user would be a wiring bug (route registered without Require), so handlers
+// fail closed.
+func requestUser(r *http.Request) (*admin.CurrentUser, bool) {
+	return admin.FromContext(r.Context())
+}
+
 func (s *Service) AdminListVaults(w http.ResponseWriter, r *http.Request) {
-	vaults, err := s.ListVaults(r.Context(), nil)
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	vaults, err := s.ListVaults(r.Context(), user.ID, nil)
 	if err != nil {
 		httpjson.Error(w, http.StatusInternalServerError, "list_vaults_failed")
 		return
@@ -333,12 +369,17 @@ func (s *Service) AdminListVaults(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) AdminCreateVault(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	var input VaultInput
 	if err := httpjson.Decode(r, &input); err != nil {
 		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
 		return
 	}
-	v, err := s.CreateVault(r.Context(), input)
+	v, err := s.CreateVault(r.Context(), user.ID, input)
 	if err != nil {
 		httpjson.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -347,12 +388,17 @@ func (s *Service) AdminCreateVault(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) AdminUpdateVault(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	var input VaultInput
 	if err := httpjson.Decode(r, &input); err != nil {
 		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
 		return
 	}
-	v, err := s.UpdateVault(r.Context(), r.PathValue("id"), input)
+	v, err := s.UpdateVault(r.Context(), user.ID, r.PathValue("id"), input)
 	if err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
@@ -361,7 +407,12 @@ func (s *Service) AdminUpdateVault(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) AdminDeleteVault(w http.ResponseWriter, r *http.Request) {
-	if err := s.DeleteVault(r.Context(), r.PathValue("id")); err != nil {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if err := s.DeleteVault(r.Context(), user.ID, r.PathValue("id")); err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
 	}
@@ -369,7 +420,12 @@ func (s *Service) AdminDeleteVault(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) AdminListEntries(w http.ResponseWriter, r *http.Request) {
-	entries, err := s.ListEntries(r.Context(), r.URL.Query().Get("vault_id"))
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	entries, err := s.ListEntries(r.Context(), user.ID, r.URL.Query().Get("vault_id"))
 	if err != nil {
 		httpjson.Error(w, http.StatusInternalServerError, "list_entries_failed")
 		return
@@ -378,12 +434,21 @@ func (s *Service) AdminListEntries(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) AdminCreateEntry(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	var input EntryInput
 	if err := httpjson.Decode(r, &input); err != nil {
 		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
 		return
 	}
-	entry, err := s.CreateEntry(r.Context(), input)
+	entry, err := s.CreateEntry(r.Context(), user.ID, input)
+	if err == ErrForbidden {
+		httpjson.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	if err != nil {
 		httpjson.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -392,12 +457,17 @@ func (s *Service) AdminCreateEntry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) AdminUpdateEntry(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	var input EntryInput
 	if err := httpjson.Decode(r, &input); err != nil {
 		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
 		return
 	}
-	entry, err := s.UpdateEntry(r.Context(), r.PathValue("id"), input)
+	entry, err := s.UpdateEntry(r.Context(), user.ID, r.PathValue("id"), input)
 	if err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
@@ -406,7 +476,12 @@ func (s *Service) AdminUpdateEntry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) AdminDeleteEntry(w http.ResponseWriter, r *http.Request) {
-	if err := s.DeleteEntry(r.Context(), r.PathValue("id")); err != nil {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if err := s.DeleteEntry(r.Context(), user.ID, r.PathValue("id")); err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
 	}
@@ -414,7 +489,12 @@ func (s *Service) AdminDeleteEntry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) AdminRevealEntry(w http.ResponseWriter, r *http.Request) {
-	value, err := s.RevealEntry(r.Context(), r.PathValue("id"))
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	value, err := s.RevealEntry(r.Context(), user.ID, r.PathValue("id"))
 	if err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
@@ -424,7 +504,7 @@ func (s *Service) AdminRevealEntry(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) APIListVaults(w http.ResponseWriter, r *http.Request) {
 	key, _ := apikeys.FromContext(r.Context())
-	vaults, err := s.ListVaults(r.Context(), key)
+	vaults, err := s.ListVaults(r.Context(), key.OwnerID, key.VaultScope)
 	if err != nil {
 		httpjson.Error(w, http.StatusInternalServerError, "list_vaults_failed")
 		return
@@ -435,11 +515,11 @@ func (s *Service) APIListVaults(w http.ResponseWriter, r *http.Request) {
 func (s *Service) APIGetVault(w http.ResponseWriter, r *http.Request) {
 	key, _ := apikeys.FromContext(r.Context())
 	id := r.PathValue("id")
-	if key != nil && !key.CanAccessVault(id) {
+	if !key.CanAccessVault(id) {
 		httpjson.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	v, err := s.getVault(r.Context(), id)
+	v, err := s.getVault(r.Context(), key.OwnerID, id)
 	if err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
@@ -463,16 +543,16 @@ func (s *Service) APIListEntries(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) APIGetEntry(w http.ResponseWriter, r *http.Request) {
 	key, _ := apikeys.FromContext(r.Context())
-	entry, err := s.getEntry(r.Context(), r.PathValue("id"))
+	entry, err := s.getEntry(r.Context(), key.OwnerID, r.PathValue("id"))
 	if err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
 	}
-	if key != nil && !key.CanAccessVault(entry.VaultID) {
+	if !key.CanAccessVault(entry.VaultID) {
 		httpjson.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	value, err := s.RevealEntry(r.Context(), entry.ID)
+	value, err := s.RevealEntry(r.Context(), key.OwnerID, entry.ID)
 	if err != nil {
 		httpjson.Error(w, http.StatusInternalServerError, "reveal_entry_failed")
 		return
@@ -487,11 +567,15 @@ func (s *Service) APICreateEntry(w http.ResponseWriter, r *http.Request) {
 		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
 		return
 	}
-	if key != nil && !key.CanAccessVault(input.VaultID) {
+	if !key.CanAccessVault(input.VaultID) {
 		httpjson.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	entry, err := s.CreateEntry(r.Context(), input)
+	entry, err := s.CreateEntry(r.Context(), key.OwnerID, input)
+	if err == ErrForbidden {
+		httpjson.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	if err != nil {
 		httpjson.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -501,12 +585,12 @@ func (s *Service) APICreateEntry(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) APIUpdateEntry(w http.ResponseWriter, r *http.Request) {
 	key, _ := apikeys.FromContext(r.Context())
-	existing, err := s.getEntry(r.Context(), r.PathValue("id"))
+	existing, err := s.getEntry(r.Context(), key.OwnerID, r.PathValue("id"))
 	if err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
 	}
-	if key != nil && !key.CanAccessVault(existing.VaultID) {
+	if !key.CanAccessVault(existing.VaultID) {
 		httpjson.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
@@ -515,7 +599,7 @@ func (s *Service) APIUpdateEntry(w http.ResponseWriter, r *http.Request) {
 		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
 		return
 	}
-	entry, err := s.UpdateEntry(r.Context(), r.PathValue("id"), input)
+	entry, err := s.UpdateEntry(r.Context(), key.OwnerID, r.PathValue("id"), input)
 	if err != nil {
 		httpjson.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -525,29 +609,37 @@ func (s *Service) APIUpdateEntry(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) APIDeleteEntry(w http.ResponseWriter, r *http.Request) {
 	key, _ := apikeys.FromContext(r.Context())
-	existing, err := s.getEntry(r.Context(), r.PathValue("id"))
+	existing, err := s.getEntry(r.Context(), key.OwnerID, r.PathValue("id"))
 	if err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
 	}
-	if key != nil && !key.CanAccessVault(existing.VaultID) {
+	if !key.CanAccessVault(existing.VaultID) {
 		httpjson.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	if err := s.DeleteEntry(r.Context(), existing.ID); err != nil {
+	if err := s.DeleteEntry(r.Context(), key.OwnerID, existing.ID); err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Service) getVault(ctx context.Context, id string) (Vault, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, description, created_at, updated_at FROM vaults WHERE id = ?`, id)
+func (s *Service) ownsVault(ctx context.Context, ownerID, vaultID string) bool {
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM vaults WHERE id = $1 AND owner_id = $2`, vaultID, ownerID).Scan(&one)
+	return err == nil
+}
+
+func (s *Service) getVault(ctx context.Context, ownerID, id string) (Vault, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, description, created_at, updated_at FROM vaults WHERE id = $1 AND owner_id = $2`, id, ownerID)
 	return scanVault(row)
 }
 
-func (s *Service) getEntry(ctx context.Context, id string) (Entry, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, vault_id, path, type, metadata, tags, created_at, updated_at FROM entries WHERE id = ?`, id)
+func (s *Service) getEntry(ctx context.Context, ownerID, id string) (Entry, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT e.id, e.vault_id, e.path, e.type, e.metadata, e.tags, e.created_at, e.updated_at
+		FROM entries e JOIN vaults v ON v.id = e.vault_id
+		WHERE e.id = $1 AND v.owner_id = $2`, id, ownerID)
 	return scanEntry(row)
 }
 
@@ -624,4 +716,8 @@ func randomID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+func nowRFC3339() string {
+	return time.Now().UTC().Format(time.RFC3339)
 }

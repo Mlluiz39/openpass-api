@@ -1,0 +1,43 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openpass}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (copy from .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-openpass}
+    ports:
+      # Host access for local development and `go test`; change or remove if
+      # 5432 is already taken on this machine.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openpass} -d ${POSTGRES_DB:-openpass}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Set DATABASE_URL in .env to override the default below (e.g. to add
+      # sslmode or a non-default user).
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-openpass}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-openpass}?sslmode=disable}
+      OPENPASS_ADMIN_EMAIL: ${OPENPASS_ADMIN_EMAIL:-admin@openpass.local}
+      OPENPASS_ADMIN_PASSWORD: ${OPENPASS_ADMIN_PASSWORD:-}
+      OPENPASS_SECRET_KEY: ${OPENPASS_SECRET_KEY:-}
+      OPENPASS_SECRET_FILE: /data/openpass.secret
+    ports:
+      - "${OPENPASS_PORT:-8080}:8080"
+    volumes:
+      # Holds openpass.secret (app encryption key). The directory must be
+      # writable by the container user:  mkdir -p data && sudo chown 10001 data
+      - ./data:/data
+
+volumes:
+  pgdata:

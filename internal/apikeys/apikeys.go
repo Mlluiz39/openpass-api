@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/openpass/api/internal/admin"
 	"github.com/openpass/api/internal/audit"
 	"github.com/openpass/api/internal/httpjson"
 	"github.com/openpass/api/internal/secure"
@@ -83,6 +84,7 @@ type AuthenticatedKey struct {
 	ID           string
 	Name         string
 	Prefix       string
+	OwnerID      string
 	Permissions  map[string]bool
 	VaultScope   []string
 	RateLimitRPM int
@@ -109,7 +111,7 @@ func WithContext(ctx context.Context, key *AuthenticatedKey) context.Context {
 	return context.WithValue(ctx, authContextKey, key)
 }
 
-func (s *Service) Create(ctx context.Context, input CreateInput) (CreatedKey, error) {
+func (s *Service) Create(ctx context.Context, ownerID string, input CreateInput) (CreatedKey, error) {
 	if strings.TrimSpace(input.Name) == "" {
 		return CreatedKey{}, errors.New("name required")
 	}
@@ -153,10 +155,11 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreatedKey, er
 	}
 
 	_, err = s.db.ExecContext(ctx, `INSERT INTO api_keys(
-		id, name, description, key_prefix, key_hash, key_suffix, encrypted_token,
-		permissions, allowed_ips, vault_scope, rate_limit_rpm, expires_at
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, owner_id, name, description, key_prefix, key_hash, key_suffix, encrypted_token,
+		permissions, allowed_ips, vault_scope, rate_limit_rpm, expires_at, created_at, updated_at
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 		id,
+		ownerID,
 		strings.TrimSpace(input.Name),
 		strings.TrimSpace(input.Description),
 		generated.Prefix,
@@ -168,6 +171,8 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreatedKey, er
 		vaultScopeJSON,
 		input.RateLimitRPM,
 		input.ExpiresAt,
+		nowRFC3339(),
+		nowRFC3339(),
 	)
 	if err != nil {
 		return CreatedKey{}, err
@@ -188,16 +193,16 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreatedKey, er
 	}, nil
 }
 
-func (s *Service) Reveal(ctx context.Context, id string) (string, error) {
+func (s *Service) Reveal(ctx context.Context, ownerID, id string) (string, error) {
 	var encrypted string
-	if err := s.db.QueryRowContext(ctx, `SELECT encrypted_token FROM api_keys WHERE id = ?`, id).Scan(&encrypted); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT encrypted_token FROM api_keys WHERE id = $1 AND owner_id = $2`, id, ownerID).Scan(&encrypted); err != nil {
 		return "", err
 	}
 	return s.box.DecryptString(encrypted)
 }
 
-func (s *Service) Revoke(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE api_keys SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
+func (s *Service) Revoke(ctx context.Context, ownerID, id string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE api_keys SET is_active = 0, updated_at = $1 WHERE id = $2 AND owner_id = $3`, nowRFC3339(), id, ownerID)
 	if err != nil {
 		return err
 	}
@@ -208,8 +213,8 @@ func (s *Service) Revoke(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Service) Delete(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM api_keys WHERE id = ?`, id)
+func (s *Service) Delete(ctx context.Context, ownerID, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM api_keys WHERE id = $1 AND owner_id = $2`, id, ownerID)
 	if err != nil {
 		return err
 	}
@@ -220,8 +225,8 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Service) List(ctx context.Context) ([]KeyRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, description, key_prefix, key_suffix, permissions, allowed_ips, vault_scope, rate_limit_rpm, is_active, last_used_at, expires_at, created_at, updated_at FROM api_keys ORDER BY created_at DESC`)
+func (s *Service) List(ctx context.Context, ownerID string) ([]KeyRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, description, key_prefix, key_suffix, permissions, allowed_ips, vault_scope, rate_limit_rpm, is_active, last_used_at, expires_at, created_at, updated_at FROM api_keys WHERE owner_id = $1 ORDER BY created_at DESC`, ownerID)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +267,7 @@ func (s *Service) Authenticate(r *http.Request, requiredPermission string) (*Aut
 		return nil, http.StatusUnauthorized, ErrUnauthorized
 	}
 
-	rows, err := s.db.QueryContext(r.Context(), `SELECT id, name, key_hash, permissions, allowed_ips, vault_scope, rate_limit_rpm, expires_at FROM api_keys WHERE key_prefix = ? AND is_active = 1`, prefix)
+	rows, err := s.db.QueryContext(r.Context(), `SELECT id, owner_id, name, key_hash, permissions, allowed_ips, vault_scope, rate_limit_rpm, expires_at FROM api_keys WHERE key_prefix = $1 AND is_active = 1`, prefix)
 	if err != nil {
 		return nil, http.StatusUnauthorized, ErrUnauthorized
 	}
@@ -271,7 +276,7 @@ func (s *Service) Authenticate(r *http.Request, requiredPermission string) (*Aut
 	for rows.Next() {
 		key, status, err := s.scanAndCheckCandidate(r, rows, token, requiredPermission)
 		if err == nil {
-			_, _ = s.db.ExecContext(r.Context(), `UPDATE api_keys SET last_used_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339), key.ID)
+			_, _ = s.db.ExecContext(r.Context(), `UPDATE api_keys SET last_used_at = $1 WHERE id = $2`, time.Now().UTC().Format(time.RFC3339), key.ID)
 			return key, http.StatusOK, nil
 		}
 		if status == http.StatusForbidden || status == http.StatusTooManyRequests {
@@ -340,8 +345,19 @@ func (s *Service) AuthMeHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// requestUser returns the session user injected by admin.Require; handlers
+// fail closed when it is missing.
+func requestUser(r *http.Request) (*admin.CurrentUser, bool) {
+	return admin.FromContext(r.Context())
+}
+
 func (s *Service) ListHandler(w http.ResponseWriter, r *http.Request) {
-	keys, err := s.List(r.Context())
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	keys, err := s.List(r.Context(), user.ID)
 	if err != nil {
 		httpjson.Error(w, http.StatusInternalServerError, "list_keys_failed")
 		return
@@ -350,12 +366,17 @@ func (s *Service) ListHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) CreateHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	var input CreateInput
 	if err := httpjson.Decode(r, &input); err != nil {
 		httpjson.Error(w, http.StatusBadRequest, "invalid_json")
 		return
 	}
-	created, err := s.Create(r.Context(), input)
+	created, err := s.Create(r.Context(), user.ID, input)
 	if err != nil {
 		httpjson.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -364,7 +385,12 @@ func (s *Service) CreateHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) RevealHandler(w http.ResponseWriter, r *http.Request) {
-	token, err := s.Reveal(r.Context(), r.PathValue("id"))
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	token, err := s.Reveal(r.Context(), user.ID, r.PathValue("id"))
 	if err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
@@ -373,7 +399,12 @@ func (s *Service) RevealHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) RevokeHandler(w http.ResponseWriter, r *http.Request) {
-	if err := s.Revoke(r.Context(), r.PathValue("id")); err != nil {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if err := s.Revoke(r.Context(), user.ID, r.PathValue("id")); err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
 	}
@@ -381,7 +412,12 @@ func (s *Service) RevokeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) DeleteHandler(w http.ResponseWriter, r *http.Request) {
-	if err := s.Delete(r.Context(), r.PathValue("id")); err != nil {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if err := s.Delete(r.Context(), user.ID, r.PathValue("id")); err != nil {
 		httpjson.Error(w, http.StatusNotFound, "not_found")
 		return
 	}
@@ -389,10 +425,10 @@ func (s *Service) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) scanAndCheckCandidate(r *http.Request, rows *sql.Rows, token, requiredPermission string) (*AuthenticatedKey, int, error) {
-	var id, name, hash, permissionsRaw string
+	var id, ownerID, name, hash, permissionsRaw string
 	var allowedRaw, scopeRaw, expiresRaw sql.NullString
 	var rpm int
-	if err := rows.Scan(&id, &name, &hash, &permissionsRaw, &allowedRaw, &scopeRaw, &rpm, &expiresRaw); err != nil {
+	if err := rows.Scan(&id, &ownerID, &name, &hash, &permissionsRaw, &allowedRaw, &scopeRaw, &rpm, &expiresRaw); err != nil {
 		return nil, http.StatusUnauthorized, ErrUnauthorized
 	}
 	if !secure.VerifySHA256(token, hash) {
@@ -421,6 +457,7 @@ func (s *Service) scanAndCheckCandidate(r *http.Request, rows *sql.Rows, token, 
 		ID:           id,
 		Name:         name,
 		Prefix:       secure.ExtractPrefix(token),
+		OwnerID:      ownerID,
 		Permissions:  permissions,
 		VaultScope:   unmarshalList(scopeRaw.String),
 		RateLimitRPM: rpm,
@@ -584,6 +621,10 @@ func randomID() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
+func nowRFC3339() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
 func stringInt(value int) string {
 	return stringInt64(int64(value))
 }
@@ -626,13 +667,17 @@ func (s *Service) recordAudit(r *http.Request, key *AuthenticatedKey, status int
 	}
 	var apiKeyID *string
 	keyPrefix := secure.ExtractPrefix(extractBearer(r))
+	var ownerID *string
 	if key != nil {
 		id := key.ID
 		apiKeyID = &id
 		keyPrefix = key.Prefix
+		owner := key.OwnerID
+		ownerID = &owner
 	}
 	_ = s.auditSvc.Record(r.Context(), audit.Entry{
 		APIKeyID:   apiKeyID,
+		OwnerID:    ownerID,
 		KeyPrefix:  keyPrefix,
 		IPAddress:  clientIP(r),
 		UserAgent:  r.UserAgent(),

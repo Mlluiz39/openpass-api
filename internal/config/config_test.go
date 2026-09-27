@@ -9,7 +9,7 @@ import (
 func TestLoadUsesDefaultsAndPersistsGeneratedSecret(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("OPENPASS_ADDR", "")
-	t.Setenv("OPENPASS_DB_PATH", filepath.Join(dir, "openpass.db"))
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/openpass_test?sslmode=disable")
 	t.Setenv("OPENPASS_SECRET_FILE", filepath.Join(dir, "openpass.secret"))
 	t.Setenv("OPENPASS_SECRET_KEY", "")
 	t.Setenv("OPENPASS_ADMIN_PASSWORD", "admin-pass")
@@ -20,6 +20,9 @@ func TestLoadUsesDefaultsAndPersistsGeneratedSecret(t *testing.T) {
 	}
 	if cfg.Addr != ":8080" {
 		t.Fatalf("Addr = %q, want :8080", cfg.Addr)
+	}
+	if cfg.DatabaseURL != "postgres://user:pass@localhost:5432/openpass_test?sslmode=disable" {
+		t.Fatalf("DatabaseURL = %q, want DATABASE_URL value", cfg.DatabaseURL)
 	}
 	if cfg.AdminPassword != "admin-pass" {
 		t.Fatalf("AdminPassword not loaded")
@@ -42,7 +45,7 @@ func TestLoadUsesDefaultsAndPersistsGeneratedSecret(t *testing.T) {
 
 func TestLoadGeneratesTemporaryAdminPasswordWhenMissing(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("OPENPASS_DB_PATH", filepath.Join(dir, "openpass.db"))
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/openpass_test?sslmode=disable")
 	t.Setenv("OPENPASS_SECRET_FILE", filepath.Join(dir, "openpass.secret"))
 	t.Setenv("OPENPASS_SECRET_KEY", "local-secret")
 	t.Setenv("OPENPASS_ADMIN_PASSWORD", "")
@@ -61,7 +64,7 @@ func TestLoadGeneratesTemporaryAdminPasswordWhenMissing(t *testing.T) {
 
 func TestLoadParsesResetFlag(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("OPENPASS_DB_PATH", filepath.Join(dir, "openpass.db"))
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/openpass_test?sslmode=disable")
 	t.Setenv("OPENPASS_SECRET_FILE", filepath.Join(dir, "openpass.secret"))
 	t.Setenv("OPENPASS_SECRET_KEY", "local-secret")
 	t.Setenv("OPENPASS_ADMIN_PASSWORD", "admin-pass")
@@ -98,7 +101,7 @@ func TestLoadParsesResetFlag(t *testing.T) {
 
 func TestLoadRejectsResetWithoutPassword(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("OPENPASS_DB_PATH", filepath.Join(dir, "openpass.db"))
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/openpass_test?sslmode=disable")
 	t.Setenv("OPENPASS_SECRET_FILE", filepath.Join(dir, "openpass.secret"))
 	t.Setenv("OPENPASS_SECRET_KEY", "local-secret")
 	t.Setenv("OPENPASS_ADMIN_PASSWORD", "")

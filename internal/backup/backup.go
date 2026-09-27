@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openpass/api/internal/admin"
 	"github.com/openpass/api/internal/httpjson"
 	"github.com/openpass/api/internal/secure"
 )
@@ -33,20 +34,28 @@ const (
 	backupKeyBytes   = 32
 )
 
-var backupTables = []string{
-	"api_keys",
-	"vaults",
-	"entries",
-	"backups",
-	"api_audit_logs",
+// backupTables are exported in this order. Queries are owner-scoped;
+// entries are scoped through their vault (they have no owner_id of their own).
+var backupTables = []struct {
+	name  string
+	query string
+}{
+	{"api_keys", `SELECT * FROM api_keys WHERE owner_id = $1`},
+	{"vaults", `SELECT * FROM vaults WHERE owner_id = $1`},
+	{"entries", `SELECT e.* FROM entries e JOIN vaults v ON v.id = e.vault_id WHERE v.owner_id = $1`},
+	{"backups", `SELECT * FROM backups WHERE owner_id = $1`},
+	{"api_audit_logs", `SELECT * FROM api_audit_logs WHERE owner_id = $1`},
 }
 
-var restoreDeleteOrder = []string{
-	"api_audit_logs",
-	"backups",
-	"entries",
-	"vaults",
-	"api_keys",
+// restoreDeleteOrder clears only the restoring user's rows, in FK-safe order.
+var restoreDeleteOrder = []struct {
+	query string
+}{
+	{`DELETE FROM api_audit_logs WHERE owner_id = $1`},
+	{`DELETE FROM backups WHERE owner_id = $1`},
+	{`DELETE FROM entries WHERE vault_id IN (SELECT id FROM vaults WHERE owner_id = $1)`},
+	{`DELETE FROM vaults WHERE owner_id = $1`},
+	{`DELETE FROM api_keys WHERE owner_id = $1`},
 }
 
 var restoreInsertOrder = []string{
@@ -89,8 +98,10 @@ func New(database *sql.DB, appSecret string) *Service {
 	return &Service{db: database, appSecret: appSecret}
 }
 
-func (s *Service) Export(ctx context.Context, password string) (File, error) {
-	doc, err := s.collect(ctx)
+// Export produces an encrypted .opbackup snapshot of one user's data only:
+// their API keys, vaults, entries, backup history and audit rows.
+func (s *Service) Export(ctx context.Context, ownerID, password string) (File, error) {
+	doc, err := s.collect(ctx, ownerID)
 	if err != nil {
 		return File{}, err
 	}
@@ -121,11 +132,15 @@ func (s *Service) Export(ctx context.Context, password string) (File, error) {
 		return File{}, err
 	}
 	filename := "openpass-backup-" + time.Now().UTC().Format("20060102-150405") + ".opbackup"
-	_ = s.record(ctx, filename, len(content), "exported")
+	_ = s.record(ctx, ownerID, filename, len(content), "exported")
 	return File{Filename: filename, Content: content}, nil
 }
 
-func (s *Service) Restore(ctx context.Context, content []byte, password string) error {
+// Restore replaces the restoring user's data with the snapshot contents.
+// Rows carrying another owner are re-owned: every inserted owner_id is
+// forced to ownerID, so a crafted backup can never inject rows into a
+// different account.
+func (s *Service) Restore(ctx context.Context, ownerID string, content []byte, password string) error {
 	var envelope encryptedDocument
 	if err := json.Unmarshal(bytes.TrimSpace(content), &envelope); err != nil {
 		return err
@@ -152,7 +167,7 @@ func (s *Service) Restore(ctx context.Context, content []byte, password string) 
 	defer tx.Rollback()
 
 	for _, table := range restoreDeleteOrder {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
+		if _, err := tx.ExecContext(ctx, table.query, ownerID); err != nil {
 			return err
 		}
 	}
@@ -165,7 +180,11 @@ func (s *Service) Restore(ctx context.Context, content []byte, password string) 
 		if err != nil {
 			return err
 		}
+		reown := table != "entries"
 		for _, row := range rows {
+			if reown {
+				row["owner_id"] = ownerID
+			}
 			if err := insertRow(ctx, tx, table, columns, row); err != nil {
 				return err
 			}
@@ -174,7 +193,7 @@ func (s *Service) Restore(ctx context.Context, content []byte, password string) 
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.record(ctx, "restore-"+time.Now().UTC().Format("20060102-150405"), len(content), "restored")
+	return s.record(ctx, ownerID, "restore-"+time.Now().UTC().Format("20060102-150405"), len(content), "restored")
 }
 
 func (s *Service) RegisterAdminRoutes(mux *http.ServeMux, require func(http.Handler) http.Handler) {
@@ -184,14 +203,24 @@ func (s *Service) RegisterAdminRoutes(mux *http.ServeMux, require func(http.Hand
 	mux.Handle("POST /api/admin/backup/restore", require(http.HandlerFunc(s.RestoreHandler)))
 }
 
+// requestUser returns the session user injected by admin.Require.
+func requestUser(r *http.Request) (*admin.CurrentUser, bool) {
+	return admin.FromContext(r.Context())
+}
+
 func (s *Service) ExportHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	var body struct {
 		Password string `json:"password"`
 	}
 	if r.Body != nil {
 		_ = httpjson.Decode(r, &body)
 	}
-	file, err := s.Export(r.Context(), body.Password)
+	file, err := s.Export(r.Context(), user.ID, body.Password)
 	if err != nil {
 		httpjson.Error(w, http.StatusInternalServerError, "backup_export_failed")
 		return
@@ -203,6 +232,11 @@ func (s *Service) ExportHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) RestoreHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	var body struct {
 		Password string `json:"password"`
 		Backup   string `json:"backup"`
@@ -215,7 +249,7 @@ func (s *Service) RestoreHandler(w http.ResponseWriter, r *http.Request) {
 		httpjson.Error(w, http.StatusBadRequest, "backup_required")
 		return
 	}
-	if err := s.Restore(r.Context(), []byte(body.Backup), body.Password); err != nil {
+	if err := s.Restore(r.Context(), user.ID, []byte(body.Backup), body.Password); err != nil {
 		httpjson.Error(w, http.StatusBadRequest, "backup_restore_failed")
 		return
 	}
@@ -223,7 +257,12 @@ func (s *Service) RestoreHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) ListHandler(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), `SELECT id, filename, size_bytes, format, status, created_at FROM backups ORDER BY created_at DESC LIMIT 50`)
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	rows, err := s.db.QueryContext(r.Context(), `SELECT id, filename, size_bytes, format, status, created_at FROM backups WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 50`, user.ID)
 	if err != nil {
 		httpjson.Error(w, http.StatusInternalServerError, "list_backups_failed")
 		return
@@ -250,19 +289,24 @@ func (s *Service) ListHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) ClearHistoryHandler(w http.ResponseWriter, r *http.Request) {
-	if err := s.ClearHistory(r.Context()); err != nil {
+	user, ok := requestUser(r)
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if err := s.ClearHistory(r.Context(), user.ID); err != nil {
 		httpjson.Error(w, http.StatusInternalServerError, "clear_backup_history_failed")
 		return
 	}
 	httpjson.Write(w, http.StatusOK, map[string]any{"cleared": true})
 }
 
-func (s *Service) ClearHistory(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM backups`)
+func (s *Service) ClearHistory(ctx context.Context, ownerID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM backups WHERE owner_id = $1`, ownerID)
 	return err
 }
 
-func (s *Service) collect(ctx context.Context) (document, error) {
+func (s *Service) collect(ctx context.Context, ownerID string) (document, error) {
 	doc := document{
 		Format:    FormatVersion,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
@@ -271,7 +315,7 @@ func (s *Service) collect(ctx context.Context) (document, error) {
 		Meta:      map[string]string{"source": "openpass"},
 	}
 	for _, table := range backupTables {
-		rows, err := s.db.QueryContext(ctx, "SELECT * FROM "+table)
+		rows, err := s.db.QueryContext(ctx, table.query, ownerID)
 		if err != nil {
 			return document{}, err
 		}
@@ -279,8 +323,8 @@ func (s *Service) collect(ctx context.Context) (document, error) {
 		if err != nil {
 			return document{}, err
 		}
-		doc.Tables[table] = tableRows
-		doc.Counts[table] = len(tableRows)
+		doc.Tables[table.name] = tableRows
+		doc.Counts[table.name] = len(tableRows)
 	}
 	return doc, nil
 }
@@ -320,19 +364,20 @@ func normalizeValue(value any) any {
 }
 
 func tableColumns(ctx context.Context, tx *sql.Tx, table string) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	// current_schema() instead of a hard-coded "public": tests run with a
+	// per-test search_path so tables live in a scratch schema.
+	rows, err := tx.QueryContext(ctx,
+		`SELECT column_name FROM information_schema.columns
+		 WHERE table_schema = current_schema() AND table_name = $1
+		 ORDER BY ordinal_position`, table)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var columns []string
 	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notNull int
-		var defaultValue any
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+		var name string
+		if err := rows.Scan(&name); err != nil {
 			return nil, err
 		}
 		columns = append(columns, name)
@@ -350,7 +395,7 @@ func insertRow(ctx context.Context, tx *sql.Tx, table string, columns []string, 
 			continue
 		}
 		names = append(names, column)
-		placeholders = append(placeholders, "?")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)+1))
 		args = append(args, value)
 	}
 	if len(names) == 0 {
@@ -361,12 +406,13 @@ func insertRow(ctx context.Context, tx *sql.Tx, table string, columns []string, 
 	return err
 }
 
-func (s *Service) record(ctx context.Context, filename string, size int, status string) error {
+func (s *Service) record(ctx context.Context, ownerID, filename string, size int, status string) error {
 	id, err := randomID()
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO backups(id, filename, size_bytes, format, status) VALUES(?,?,?,?,?)`, id, filename, size, "opbackup", status)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO backups(id, owner_id, filename, size_bytes, format, status, created_at) VALUES($1,$2,$3,$4,$5,$6,$7)`,
+		id, ownerID, filename, size, "opbackup", status, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 

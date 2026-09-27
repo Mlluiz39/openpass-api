@@ -27,24 +27,27 @@ func main() {
 		log.Fatal(err)
 	}
 	if cfg.GeneratedAdminPassword {
-		log.Printf("OPENPASS_ADMIN_PASSWORD not set; temporary admin password: %s", cfg.AdminPassword)
+		log.Printf("OPENPASS_ADMIN_PASSWORD not set; temporary admin password: %s (login e-mail: %s)", cfg.AdminPassword, cfg.AdminEmail)
 	}
 
-	database, err := opdb.Open(cfg.DatabasePath)
+	database, err := opdb.Open(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer database.Close()
-	if err := opdb.Migrate(database, opdb.CoreSchema); err != nil {
+	if err := opdb.Migrate(database); err != nil {
 		log.Fatal(err)
 	}
 
 	adminSvc := admin.New(database, cfg.AdminPassword, cfg.SecretKey)
+	if err := adminSvc.Bootstrap(cfg.AdminEmail); err != nil {
+		log.Fatalf("failed to bootstrap first admin: %v", err)
+	}
 	if cfg.ResetAdminPassword {
 		if err := adminSvc.ResetPassword(); err != nil {
 			log.Fatalf("failed to reset admin password: %v", err)
 		}
-		log.Printf("OPENPASS_ADMIN_PASSWORD_RESET set; admin password replaced by OPENPASS_ADMIN_PASSWORD")
+		log.Printf("OPENPASS_ADMIN_PASSWORD_RESET set; first admin password replaced by OPENPASS_ADMIN_PASSWORD")
 	}
 	auditSvc := audit.New(database)
 	keySvc := apikeys.New(database, cfg.SecretKey)
@@ -54,6 +57,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	adminSvc.RegisterRoutes(mux)
+	adminSvc.RegisterUserRoutes(mux, adminSvc.Require)
 	keySvc.RegisterAdminRoutes(mux, adminSvc.Require)
 	keySvc.RegisterAPIRoutes(mux)
 	auditSvc.RegisterAdminRoutes(mux, adminSvc.Require)
@@ -96,7 +100,8 @@ func main() {
 
 func registerBackupRoutes(mux *http.ServeMux, backups *backup.Service, keys *apikeys.Service) {
 	mux.Handle("POST /api/v1/backup/create", keys.RequirePermission("backup:create", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		file, err := backups.Export(r.Context(), r.URL.Query().Get("password"))
+		key, _ := apikeys.FromContext(r.Context())
+		file, err := backups.Export(r.Context(), key.OwnerID, r.URL.Query().Get("password"))
 		if err != nil {
 			httpjson.Error(w, http.StatusInternalServerError, "backup_export_failed")
 			return
@@ -108,6 +113,7 @@ func registerBackupRoutes(mux *http.ServeMux, backups *backup.Service, keys *api
 	})))
 
 	mux.Handle("POST /api/v1/backup/restore", keys.RequirePermission("backup:restore", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key, _ := apikeys.FromContext(r.Context())
 		var body struct {
 			Password string `json:"password"`
 			Backup   string `json:"backup"`
@@ -116,7 +122,7 @@ func registerBackupRoutes(mux *http.ServeMux, backups *backup.Service, keys *api
 			httpjson.Error(w, http.StatusBadRequest, "invalid_json")
 			return
 		}
-		if err := backups.Restore(r.Context(), []byte(body.Backup), body.Password); err != nil {
+		if err := backups.Restore(r.Context(), key.OwnerID, []byte(body.Backup), body.Password); err != nil {
 			httpjson.Error(w, http.StatusBadRequest, "backup_restore_failed")
 			return
 		}

@@ -1,206 +1,162 @@
 package db
 
 import (
+	"context"
 	"database/sql"
-	"os"
-	"path/filepath"
+	"embed"
+	"errors"
+	"fmt"
+	"io/fs"
+	"regexp"
+	"sort"
+	"strconv"
+	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-const CoreSchema = `
-CREATE TABLE IF NOT EXISTS admin_sessions (
-    id TEXT PRIMARY KEY,
-    token_hash TEXT UNIQUE NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    expires_at TEXT NOT NULL
-);
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
-CREATE TABLE IF NOT EXISTS api_keys (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT,
-    key_prefix TEXT NOT NULL,
-    key_hash TEXT NOT NULL,
-    key_suffix TEXT NOT NULL,
-    encrypted_token TEXT NOT NULL,
-    permissions TEXT NOT NULL DEFAULT '{}',
-    allowed_ips TEXT,
-    vault_scope TEXT,
-    rate_limit_rpm INTEGER DEFAULT 60,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    last_used_at TEXT,
-    expires_at TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS vaults (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS entries (
-    id TEXT PRIMARY KEY,
-    vault_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    type TEXT NOT NULL,
-    encrypted_value TEXT,
-    metadata TEXT,
-    tags TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
-    UNIQUE(vault_id, path)
-);
-
-CREATE TABLE IF NOT EXISTS backups (
-    id TEXT PRIMARY KEY,
-    filename TEXT NOT NULL,
-    size_bytes INTEGER,
-    format TEXT DEFAULT 'zip',
-    status TEXT DEFAULT 'completed',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS api_audit_logs (
-    id TEXT PRIMARY KEY,
-    api_key_id TEXT,
-    key_prefix TEXT,
-    ip_address TEXT,
-    user_agent TEXT,
-    method TEXT NOT NULL,
-    endpoint TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    status_code INTEGER NOT NULL,
-    duration_ms INTEGER,
-    result TEXT NOT NULL CHECK (result IN ('success', 'denied', 'error')),
-    error_msg TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix, is_active);
-CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(is_active);
-CREATE INDEX IF NOT EXISTS idx_entries_vault ON entries(vault_id);
-CREATE INDEX IF NOT EXISTS idx_audit_key_id ON api_audit_logs(api_key_id);
-CREATE INDEX IF NOT EXISTS idx_audit_created ON api_audit_logs(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_ip ON api_audit_logs(ip_address);
-
-CREATE TABLE IF NOT EXISTS app_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-`
-
-func Open(path string) (*sql.DB, error) {
-	if path != ":memory:" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return nil, err
-		}
-	}
-
-	database, err := sql.Open("sqlite", path)
+// Open connects to PostgreSQL. databaseURL is a standard Postgres URL,
+// e.g. postgres://user:pass@localhost:5432/openpass?sslmode=disable.
+func Open(databaseURL string) (*sql.DB, error) {
+	database, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, err
 	}
-	if err := applyPragmas(database); err != nil {
+	// pgx connects lazily; ping so a bad URL fails at startup, not on the
+	// first request.
+	if err := database.Ping(); err != nil {
 		_ = database.Close()
-		return nil, err
+		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
 	return database, nil
 }
 
-func Migrate(database *sql.DB, schema string) error {
-	if err := resetEmptyLegacySchema(database); err != nil {
-		return err
-	}
-	_, err := database.Exec(schema)
-	return err
-}
-
-func applyPragmas(database *sql.DB) error {
-	for _, stmt := range []string{
-		"PRAGMA foreign_keys = ON",
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-	} {
-		if _, err := database.Exec(stmt); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func resetEmptyLegacySchema(database *sql.DB) error {
-	legacy, err := hasTableWithoutColumn(database, "api_keys", "encrypted_token")
-	if err != nil || !legacy {
-		return err
+// Migrate applies every embedded migrations/*.sql file not yet recorded in
+// schema_migrations, in filename order. Each file runs in its own transaction
+// so a failure never leaves a half-applied migration behind.
+func Migrate(database *sql.DB) error {
+	ctx := context.Background()
+	if _, err := database.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
 	}
 
-	for _, table := range []string{"api_keys", "vaults", "entries", "backups", "api_audit_logs"} {
-		count, err := tableCount(database, table)
-		if err != nil {
-			return err
-		}
-		if count > 0 {
-			return nil
-		}
-	}
-
-	for _, table := range []string{"api_audit_logs", "backups", "entries", "vaults", "api_keys", "users", "admin_sessions"} {
-		if _, err := database.Exec("DROP TABLE IF EXISTS " + table); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func hasTableWithoutColumn(database *sql.DB, table, column string) (bool, error) {
-	rows, err := database.Query("PRAGMA table_info(" + table + ")")
+	pending, err := pendingMigrations(database)
 	if err != nil {
-		return false, err
+		return err
 	}
-	defer rows.Close()
 
-	foundTable := false
-	foundColumn := false
+	conn, err := database.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	for _, m := range pending {
+		// Exec with no args goes through pgx's simple protocol, which is what
+		// lets a whole SQL file (many statements) run as one unit.
+		if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+			return fmt.Errorf("begin %s: %w", m.name, err)
+		}
+		if _, err := conn.ExecContext(ctx, m.sql); err != nil {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			return fmt.Errorf("apply %s: %w", m.name, err)
+		}
+		if _, err := conn.ExecContext(ctx,
+			`INSERT INTO schema_migrations(version, applied_at) VALUES($1, $2)`,
+			m.version, time.Now().UTC().Format(time.RFC3339),
+		); err != nil {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			return fmt.Errorf("record %s: %w", m.name, err)
+		}
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return fmt.Errorf("commit %s: %w", m.name, err)
+		}
+	}
+	return nil
+}
+
+type migration struct {
+	version int
+	name    string
+	sql     string
+}
+
+var migrationFilename = regexp.MustCompile(`^(\d+)_.*\.sql$`)
+
+func pendingMigrations(database *sql.DB) ([]migration, error) {
+	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	if err != nil {
+		return nil, err
+	}
+
+	applied := map[int]bool{}
+	rows, err := database.Query(`SELECT version FROM schema_migrations`)
+	if err != nil {
+		return nil, err
+	}
 	for rows.Next() {
-		foundTable = true
-		var cid int
-		var name, typ string
-		var notNull int
-		var defaultValue any
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return false, err
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			rows.Close()
+			return nil, err
 		}
-		if name == column {
-			foundColumn = true
-		}
+		applied[version] = true
 	}
 	if err := rows.Err(); err != nil {
-		return false, err
+		rows.Close()
+		return nil, err
 	}
-	return foundTable && !foundColumn, nil
+	rows.Close()
+
+	var out []migration
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		match := migrationFilename.FindStringSubmatch(entry.Name())
+		if match == nil {
+			continue
+		}
+		version, err := strconv.Atoi(match[1])
+		if err != nil {
+			return nil, err
+		}
+		if applied[version] {
+			continue
+		}
+		raw, err := migrationsFS.ReadFile("migrations/" + entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, migration{version: version, name: entry.Name(), sql: string(raw)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].version < out[j].version })
+	return out, nil
 }
 
-func tableCount(database *sql.DB, table string) (int, error) {
-	var exists string
-	err := database.QueryRow("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&exists)
-	if err == sql.ErrNoRows {
-		return 0, nil
+// IsUniqueViolation reports whether err is a PostgreSQL unique-constraint
+// violation (SQLSTATE 23505). Handlers use it to turn the raw driver error
+// into the user-facing "já existe um item com este nome" message.
+func IsUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+var identifierPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// SanitizeIdentifier validates identifiers that must be interpolated into SQL
+// (schema names, fixed allowlisted table names). Anything outside letters,
+// digits and underscores is rejected, so no injection can sneak through.
+func SanitizeIdentifier(value string) (string, error) {
+	if !identifierPattern.MatchString(value) {
+		return "", fmt.Errorf("invalid SQL identifier: %q", value)
 	}
-	if err != nil {
-		return 0, err
-	}
-	var count int
-	if err := database.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
-		return 0, err
-	}
-	return count, nil
+	return value, nil
 }

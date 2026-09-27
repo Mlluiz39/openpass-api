@@ -5,10 +5,13 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/openpass/api/internal/admin"
 	"github.com/openpass/api/internal/httpjson"
 )
 
@@ -19,6 +22,7 @@ type Service struct {
 type Entry struct {
 	ID         string  `json:"id"`
 	APIKeyID   *string `json:"api_key_id,omitempty"`
+	OwnerID    *string `json:"owner_id,omitempty"`
 	KeyPrefix  string  `json:"key_prefix,omitempty"`
 	IPAddress  string  `json:"ip_address,omitempty"`
 	UserAgent  string  `json:"user_agent,omitempty"`
@@ -33,6 +37,7 @@ type Entry struct {
 }
 
 type Filter struct {
+	OwnerID   string
 	APIKeyID  string
 	KeyPrefix string
 	Result    string
@@ -50,8 +55,15 @@ func (s *Service) RegisterAdminRoutes(mux *http.ServeMux, require func(http.Hand
 }
 
 func (s *Service) ListHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := admin.FromContext(r.Context())
+	if !ok {
+		httpjson.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	// owner-scoped: users only ever see audit rows for their own API keys.
 	logs, err := s.List(r.Context(), Filter{
+		OwnerID:   user.ID,
 		APIKeyID:  r.URL.Query().Get("api_key_id"),
 		KeyPrefix: r.URL.Query().Get("key_prefix"),
 		Result:    r.URL.Query().Get("result"),
@@ -85,11 +97,12 @@ func (s *Service) Record(ctx context.Context, entry Entry) error {
 		entry.Result = "success"
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO api_audit_logs(
-		id, api_key_id, key_prefix, ip_address, user_agent, method, endpoint,
-		request_id, status_code, duration_ms, result, error_msg
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, api_key_id, owner_id, key_prefix, ip_address, user_agent, method, endpoint,
+		request_id, status_code, duration_ms, result, error_msg, created_at
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		entry.ID,
 		entry.APIKeyID,
+		entry.OwnerID,
 		entry.KeyPrefix,
 		entry.IPAddress,
 		entry.UserAgent,
@@ -100,6 +113,7 @@ func (s *Service) Record(ctx context.Context, entry Entry) error {
 		entry.DurationMS,
 		entry.Result,
 		emptyToNil(entry.ErrorMsg),
+		time.Now().UTC().Format(time.RFC3339),
 	)
 	return err
 }
@@ -108,25 +122,30 @@ func (s *Service) List(ctx context.Context, filter Filter) ([]Entry, error) {
 	query := `SELECT id, api_key_id, key_prefix, ip_address, user_agent, method, endpoint, request_id, status_code, duration_ms, result, error_msg, created_at FROM api_audit_logs`
 	var where []string
 	var args []any
+	// placeholder tracks PostgreSQL's $n positions as conditions are appended.
+	placeholder := 0
+	addFilter := func(column, value string) {
+		placeholder++
+		where = append(where, fmt.Sprintf("%s = $%d", column, placeholder))
+		args = append(args, value)
+	}
+	if filter.OwnerID != "" {
+		addFilter("owner_id", filter.OwnerID)
+	}
 	if filter.APIKeyID != "" {
-		where = append(where, "api_key_id = ?")
-		args = append(args, filter.APIKeyID)
+		addFilter("api_key_id", filter.APIKeyID)
 	}
 	if filter.KeyPrefix != "" {
-		where = append(where, "key_prefix = ?")
-		args = append(args, filter.KeyPrefix)
+		addFilter("key_prefix", filter.KeyPrefix)
 	}
 	if filter.Result != "" {
-		where = append(where, "result = ?")
-		args = append(args, filter.Result)
+		addFilter("result", filter.Result)
 	}
 	if filter.Endpoint != "" {
-		where = append(where, "endpoint = ?")
-		args = append(args, filter.Endpoint)
+		addFilter("endpoint", filter.Endpoint)
 	}
 	if filter.IPAddress != "" {
-		where = append(where, "ip_address = ?")
-		args = append(args, filter.IPAddress)
+		addFilter("ip_address", filter.IPAddress)
 	}
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
@@ -136,7 +155,8 @@ func (s *Service) List(ctx context.Context, filter Filter) ([]Entry, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	query += " LIMIT ?"
+	placeholder++
+	query += fmt.Sprintf(" LIMIT $%d", placeholder)
 	args = append(args, limit)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)

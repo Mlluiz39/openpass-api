@@ -15,8 +15,9 @@ import (
 func TestCreateRevealAndAuthenticateKey(t *testing.T) {
 	database := testDB(t)
 	service := New(database, "secret")
+	owner := testOwner(t, database)
 
-	created, err := service.Create(context.Background(), CreateInput{
+	created, err := service.Create(context.Background(), owner, CreateInput{
 		Name:         "Claude Code",
 		Env:          "live",
 		Permissions:  map[string]bool{"vaults:read": true},
@@ -34,7 +35,7 @@ func TestCreateRevealAndAuthenticateKey(t *testing.T) {
 
 	var encryptedToken, keyHash string
 	if err := database.QueryRow(
-		`SELECT encrypted_token, key_hash FROM api_keys WHERE id = ?`,
+		`SELECT encrypted_token, key_hash FROM api_keys WHERE id = $1`,
 		created.ID,
 	).Scan(&encryptedToken, &keyHash); err != nil {
 		t.Fatalf("query created key: %v", err)
@@ -46,7 +47,7 @@ func TestCreateRevealAndAuthenticateKey(t *testing.T) {
 		t.Fatalf("stored hash does not match token")
 	}
 
-	revealed, err := service.Reveal(context.Background(), created.ID)
+	revealed, err := service.Reveal(context.Background(), owner, created.ID)
 	if err != nil {
 		t.Fatalf("Reveal() error = %v", err)
 	}
@@ -69,8 +70,9 @@ func TestCreateRevealAndAuthenticateKey(t *testing.T) {
 func TestCreateKeyWithoutPrefixAndAuthenticate(t *testing.T) {
 	database := testDB(t)
 	service := New(database, "secret")
+	owner := testOwner(t, database)
 
-	created, err := service.Create(context.Background(), CreateInput{
+	created, err := service.Create(context.Background(), owner, CreateInput{
 		Name:        "Raw Hex Key",
 		Env:         "none",
 		Permissions: map[string]bool{"vaults:read": true},
@@ -100,9 +102,10 @@ func TestCreateKeyWithoutPrefixAndAuthenticate(t *testing.T) {
 func TestCreateKeyWithCustomTokenAndAuthenticate(t *testing.T) {
 	database := testDB(t)
 	service := New(database, "secret")
+	owner := testOwner(t, database)
 
 	customToken := "my-secret-agent-api-token-custom"
-	created, err := service.Create(context.Background(), CreateInput{
+	created, err := service.Create(context.Background(), owner, CreateInput{
 		Name:        "Custom Key",
 		Token:       customToken,
 		Permissions: map[string]bool{"vaults:read": true},
@@ -114,7 +117,7 @@ func TestCreateKeyWithCustomTokenAndAuthenticate(t *testing.T) {
 		t.Fatalf("Token = %q, want %q", created.Token, customToken)
 	}
 
-	revealed, err := service.Reveal(context.Background(), created.ID)
+	revealed, err := service.Reveal(context.Background(), owner, created.ID)
 	if err != nil {
 		t.Fatalf("Reveal() error = %v", err)
 	}
@@ -137,7 +140,8 @@ func TestCreateKeyWithCustomTokenAndAuthenticate(t *testing.T) {
 func TestRevokedKeyCannotAuthenticate(t *testing.T) {
 	database := testDB(t)
 	service := New(database, "secret")
-	created, err := service.Create(context.Background(), CreateInput{
+	owner := testOwner(t, database)
+	created, err := service.Create(context.Background(), owner, CreateInput{
 		Name:        "Agent",
 		Env:         "live",
 		Permissions: map[string]bool{"vaults:read": true},
@@ -145,7 +149,7 @@ func TestRevokedKeyCannotAuthenticate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	if err := service.Revoke(context.Background(), created.ID); err != nil {
+	if err := service.Revoke(context.Background(), owner, created.ID); err != nil {
 		t.Fatalf("Revoke() error = %v", err)
 	}
 
@@ -160,7 +164,8 @@ func TestRevokedKeyCannotAuthenticate(t *testing.T) {
 func TestPermissionAllowedIPVaultScopeAndRateLimit(t *testing.T) {
 	database := testDB(t)
 	service := New(database, "secret")
-	created, err := service.Create(context.Background(), CreateInput{
+	owner := testOwner(t, database)
+	created, err := service.Create(context.Background(), owner, CreateInput{
 		Name:         "Scoped Agent",
 		Env:          "live",
 		Permissions:  map[string]bool{"entries:read": true},
@@ -216,7 +221,8 @@ func TestRequirePermissionRecordsAuditForDeniedAndSuccess(t *testing.T) {
 	auditService := audit.New(database)
 	service := New(database, "secret")
 	service.SetAudit(auditService)
-	created, err := service.Create(context.Background(), CreateInput{
+	owner := testOwner(t, database)
+	created, err := service.Create(context.Background(), owner, CreateInput{
 		Name:        "Audited Agent",
 		Env:         "live",
 		Permissions: map[string]bool{"vaults:read": true},
@@ -263,12 +269,17 @@ func TestRequirePermissionRecordsAuditForDeniedAndSuccess(t *testing.T) {
 
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
-	database, err := opdb.Open(":memory:")
+	return opdb.OpenTest(t)
+}
+
+// testOwner inserts a minimal user row: api_keys.owner_id has a foreign key
+// to users, so every key test needs an account first.
+func testOwner(t *testing.T, database *sql.DB) string {
+	t.Helper()
+	_, err := database.Exec(`INSERT INTO users(id, email, password_hash, role, status, must_change_password, created_at, updated_at)
+		VALUES('owner-1', 'owner@test.local', 'argon2id$test', 'user', 'active', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
 	if err != nil {
-		t.Fatalf("Open() error = %v", err)
+		t.Fatalf("insert test owner: %v", err)
 	}
-	if err := opdb.Migrate(database, opdb.CoreSchema); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
-	}
-	return database
+	return "owner-1"
 }

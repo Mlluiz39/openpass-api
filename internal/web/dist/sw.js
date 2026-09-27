@@ -3,7 +3,7 @@
 // Strategy: network-first for the app shell so an upgraded binary is picked up
 // on the next load, with the cached copy used only as an offline fallback. The
 // API is never intercepted: secrets must always come from the server.
-const CACHE = "openpass-shell-v1";
+const CACHE = "openpass-shell-v2";
 
 const SHELL = [
   "/",

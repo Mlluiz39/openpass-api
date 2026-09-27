@@ -4,6 +4,10 @@ const state = {
   theme: localStorage.getItem("openpass_theme") || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"),
   entries: [],
   vaults: [],
+  user: null, // { email, role, must_change_password } of the logged-in account
+  users: [], // admin-only account list
+  usersModalOpen: false,
+  newUserPassword: null, // temporary password shown once after creating a user
   activeCategory: "all",
   searchQuery: "",
   revealed: {},
@@ -149,11 +153,29 @@ async function boot() {
   initPwaInstall();
   initGlobalShortcuts();
   try {
-    await api("/api/admin/me");
+    const me = await api("/api/admin/me");
+    state.user = me;
     await loadData();
     render();
+    if (me.must_change_password) {
+      // Admin created this account with a temporary password: force the
+      // change before anything else happens in the vault.
+      state.securityModalOpen = true;
+      render();
+      showToast("Você está usando uma senha temporária. Defina a sua para continuar.", "info");
+    }
   } catch {
     renderLogin();
+  }
+}
+
+// After login/recovery the session is fresh; refresh the profile so the
+// header and the forced-change flow see the current flags.
+async function refreshUser() {
+  try {
+    state.user = await api("/api/admin/me");
+  } catch {
+    state.user = null;
   }
 }
 
@@ -266,8 +288,12 @@ function renderLogin(error = "") {
           ${error ? `<div class="login-error">${escapeHTML(error)}</div>` : ""}
           <form class="login-form" id="recoveryForm">
             <div class="form-group">
+              <label class="form-label">E-mail da conta</label>
+              <input class="form-input" type="email" name="email" autocomplete="username" placeholder="voce@exemplo.com" required autofocus />
+            </div>
+            <div class="form-group">
               <label class="form-label">Chave de Recuperação de Emergência</label>
-              <input class="form-input mono" name="recovery_key" placeholder="OP-REC-XXXX-XXXX-XXXX-XXXX" required autofocus />
+              <input class="form-input mono" name="recovery_key" placeholder="OP-REC-XXXX-XXXX-XXXX-XXXX" required />
             </div>
             <div class="form-group">
               <label class="form-label">Nova Senha Mestra</label>
@@ -314,6 +340,7 @@ function renderLogin(error = "") {
     document.querySelector("#recoveryForm").addEventListener("submit", async (e) => {
       e.preventDefault();
       const data = new FormData(e.currentTarget);
+      const email = data.get("email");
       const recoveryKey = data.get("recovery_key");
       const newPass = data.get("new_password");
       const confirmPass = data.get("confirm_password");
@@ -327,6 +354,7 @@ function renderLogin(error = "") {
         const res = await api("/api/admin/recover-password", {
           method: "POST",
           body: JSON.stringify({
+            email,
             recovery_key: recoveryKey,
             new_password: newPass,
           }),
@@ -334,6 +362,7 @@ function renderLogin(error = "") {
         state.recoveryView = false;
         state.recoveryKey = res.new_recovery_key;
         showToast("Senha redefinida com sucesso!");
+        await refreshUser();
         await loadData();
         render();
         if (res.new_recovery_key) {
@@ -357,8 +386,12 @@ function renderLogin(error = "") {
         ${error ? `<div class="login-error">${escapeHTML(error)}</div>` : ""}
         <form class="login-form" id="loginForm">
           <div class="form-group">
+            <label class="form-label">E-mail</label>
+            <input class="form-input" type="email" name="email" autocomplete="username" placeholder="voce@exemplo.com" required autofocus />
+          </div>
+          <div class="form-group">
             <label class="form-label">Senha mestra do cofre</label>
-            <input class="form-input" type="password" name="password" autocomplete="current-password" placeholder="Digite sua senha de acesso" required autofocus />
+            <input class="form-input" type="password" name="password" autocomplete="current-password" placeholder="Digite sua senha de acesso" required />
             <div style="display:flex;justify-content:flex-end;margin-top:4px;">
               <button type="button" class="link-btn" id="linkForgotPassword">Esqueci minha senha</button>
             </div>
@@ -376,16 +409,22 @@ function renderLogin(error = "") {
 
   document.querySelector("#loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const password = new FormData(e.currentTarget).get("password");
+    const data = new FormData(e.currentTarget);
     try {
-      await api("/api/admin/login", {
+      const res = await api("/api/admin/login", {
         method: "POST",
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ email: data.get("email"), password: data.get("password") }),
       });
+      state.user = res;
       await loadData();
       render();
+      if (res.must_change_password) {
+        state.securityModalOpen = true;
+        render();
+        showToast("Você está usando uma senha temporária. Defina a sua para continuar.", "info");
+      }
     } catch (err) {
-      renderLogin(err.message === "unauthorized" ? "Senha incorreta." : err.message);
+      renderLogin(err.message === "unauthorized" ? "E-mail ou senha incorretos." : err.message);
     }
   });
 }
@@ -451,6 +490,11 @@ function render() {
               <span>⬇️</span> <span class="hide-mobile">Instalar app</span>
             </button>
           ` : ""}
+          ${state.user?.role === "admin" ? `
+            <button class="btn btn-ghost" id="btnUsers" title="Gerenciar contas de usuários">
+              <span>👥</span> <span class="hide-mobile">Usuários</span>
+            </button>
+          ` : ""}
           <button class="btn btn-ghost" id="btnSecurity" title="Alterar senha e chave de recuperação">
             <span>⚙️</span> <span class="hide-mobile">Segurança</span>
           </button>
@@ -460,7 +504,7 @@ function render() {
           <button class="btn btn-ghost btn-icon" id="btnTheme" title="Alternar tema">
             ${state.theme === "dark" ? "☀️" : "🌙"}
           </button>
-          <button class="btn btn-ghost btn-icon" id="btnLogout" title="Sair do cofre">
+          <button class="btn btn-ghost btn-icon" id="btnLogout" title="Sair do cofre (${escapeHTML(state.user?.email || "")})">
             🚪
           </button>
         </div>
@@ -510,6 +554,7 @@ function render() {
     ${state.modal ? renderItemModal() : ""}
     ${state.backupModalOpen ? renderBackupModal() : ""}
     ${state.securityModalOpen ? renderSecurityModal() : ""}
+    ${state.usersModalOpen ? renderUsersModal() : ""}
   `;
 
   attachEvents();
@@ -976,6 +1021,93 @@ function renderSecurityModal() {
   `;
 }
 
+// Admin-only account management. Vault data is never shown here: this screen
+// only manages identity (create, reset password, disable, delete).
+function renderUsersModal() {
+  const currentEmail = state.user?.email || "";
+  const rows = state.users.map((u) => {
+    const isSelf = u.email === currentEmail;
+    return `
+      <div class="user-row" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--border-subtle);">
+        <div style="flex:1;min-width:180px;">
+          <div style="font-weight:600;font-size:14px;">${escapeHTML(u.display_name || u.email)}</div>
+          <div style="font-size:12px;color:var(--text-muted);">${escapeHTML(u.email)}</div>
+        </div>
+        <span class="pill-badge" style="background:${u.role === "admin" ? "var(--accent, #6c5ce7)" : "var(--bg-tertiary, #eee)"};color:${u.role === "admin" ? "#fff" : "var(--text-muted)"};padding:2px 8px;border-radius:99px;font-size:11px;">${u.role === "admin" ? "admin" : "usuário"}</span>
+        <span style="font-size:11px;color:${u.status === "active" ? "var(--success, #2ecc71)" : "var(--danger, #e74c3c)"};">${u.status === "active" ? "ativo" : "desativado"}</span>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 8px;" data-user-role="${u.id}" data-role="${u.role}" ${isSelf ? "disabled title='Não é possível alterar o próprio papel'" : ""}>${u.role === "admin" ? "Remover admin" : "Tornar admin"}</button>
+          <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 8px;" data-user-status="${u.id}" data-status="${u.status}" ${isSelf ? "disabled title='Não é possível alterar o próprio status'" : ""}>${u.status === "active" ? "Desativar" : "Ativar"}</button>
+          <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 8px;" data-user-reset="${u.id}" ${isSelf ? "disabled title='Use a tela de Segurança para mudar a própria senha'" : ""}>Nova senha</button>
+          <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 8px;color:var(--danger);" data-user-delete="${u.id}" ${isSelf ? "disabled title='Não é possível excluir a si mesmo'" : ""}>Excluir</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <div class="modal-overlay" id="usersModalBackdrop">
+      <div class="modal-content" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3 class="modal-title">Usuários do Cofre</h3>
+          <button class="icon-btn" id="usersModalClose">✕</button>
+        </div>
+
+        <div class="modal-body">
+          ${state.newUserPassword ? `
+            <div class="recovery-key-card" style="margin-bottom:12px;">
+              <div style="flex:1;">
+                <strong style="font-size:13px;">Senha temporária (visível só agora):</strong>
+                <div class="recovery-key-text" id="tempPasswordText">${escapeHTML(state.newUserPassword)}</div>
+              </div>
+              <button class="btn btn-ghost btn-icon" id="btnCopyTempPassword" title="Copiar senha temporária">📋</button>
+              <button class="icon-btn" id="btnDismissTempPassword" title="Dispensar">✕</button>
+            </div>
+          ` : ""}
+
+          <section style="display:flex;flex-direction:column;gap:12px;">
+            <h4 style="font-size:15px;font-weight:700;">➕ Convidar novo usuário</h4>
+            <form id="createUserForm" style="display:flex;flex-direction:column;gap:10px;">
+              <div class="form-group">
+                <label class="form-label">E-mail</label>
+                <input class="form-input" type="email" name="email" placeholder="voce@exemplo.com" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Nome (opcional)</label>
+                <input class="form-input" name="display_name" placeholder="Nome de exibição" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Papel</label>
+                <select class="form-input" name="role">
+                  <option value="user">Usuário (só vê o próprio cofre)</option>
+                  <option value="admin">Admin (gerencia contas)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Senha inicial (opcional — vazio gera uma)</label>
+                <input class="form-input" name="password" placeholder="Gerada automaticamente" autocomplete="new-password" />
+              </div>
+              <button class="btn btn-primary" type="submit">Criar usuário</button>
+              <p style="font-size:12px;color:var(--text-muted);margin:0;">O usuário será obrigado a trocar a senha no primeiro login. Entregue a senha temporária por um canal seguro.</p>
+            </form>
+          </section>
+
+          <hr style="border:none;border-top:1px solid var(--border-subtle);margin:8px 0;" />
+
+          <section>
+            <h4 style="font-size:15px;font-weight:700;margin-bottom:6px;">📋 Contas (${state.users.length})</h4>
+            ${state.users.length === 0 ? `<p style="font-size:13px;color:var(--text-muted);">Nenhuma conta carregada.</p>` : rows}
+          </section>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" id="usersModalCancel">Fechar</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderBackupModal() {
   return `
     <div class="modal-overlay" id="backupModalBackdrop">
@@ -1184,6 +1316,9 @@ function attachEvents() {
   
   document.querySelector("#btnLogout")?.addEventListener("click", async () => {
     await api("/api/admin/logout", { method: "POST", body: "{}" });
+    state.user = null;
+    state.users = [];
+    state.usersModalOpen = false;
     renderLogin();
   });
 
@@ -1194,6 +1329,18 @@ function attachEvents() {
 
   document.querySelector("#btnBackup")?.addEventListener("click", () => {
     state.backupModalOpen = true;
+    render();
+  });
+
+  document.querySelector("#btnUsers")?.addEventListener("click", async () => {
+    try {
+      const res = await api("/api/admin/users");
+      state.users = res.data || [];
+    } catch (err) {
+      state.users = [];
+      alert("Não foi possível carregar os usuários: " + err.message);
+    }
+    state.usersModalOpen = true;
     render();
   });
 
@@ -1380,11 +1527,118 @@ function attachEvents() {
             new_password: newPass,
           }),
         });
+        if (state.user) state.user.must_change_password = false;
         showToast("Senha alterada com sucesso!");
         closeSecurity();
       } catch (err) {
         alert("Erro ao alterar senha: " + (err.message === "senha_atual_incorreta" ? "Senha atual incorreta." : err.message));
       }
+    });
+  }
+
+  // Users Modal events (admin only)
+  if (state.usersModalOpen) {
+    const closeUsers = () => {
+      state.usersModalOpen = false;
+      state.newUserPassword = null;
+      render();
+    };
+    document.querySelector("#usersModalClose")?.addEventListener("click", closeUsers);
+    document.querySelector("#usersModalCancel")?.addEventListener("click", closeUsers);
+    bindOverlayClose("#usersModalBackdrop", closeUsers);
+
+    document.querySelector("#btnCopyTempPassword")?.addEventListener("click", () => {
+      if (state.newUserPassword) {
+        copyText(state.newUserPassword, null, "Senha temporária copiada!");
+      }
+    });
+    document.querySelector("#btnDismissTempPassword")?.addEventListener("click", () => {
+      state.newUserPassword = null;
+      render();
+    });
+
+    document.querySelector("#createUserForm")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const data = new FormData(e.currentTarget);
+      try {
+        const res = await api("/api/admin/users", {
+          method: "POST",
+          body: JSON.stringify({
+            email: data.get("email"),
+            display_name: data.get("display_name"),
+            role: data.get("role"),
+            password: data.get("password") || undefined,
+          }),
+        });
+        state.newUserPassword = res.temporary_password || null;
+        state.users = (await api("/api/admin/users")).data || [];
+        render();
+        if (state.newUserPassword) {
+          copyText(state.newUserPassword, null, "Senha temporária copiada! Envie para o usuário por um canal seguro.");
+        } else {
+          showToast("Usuário criado com sucesso!");
+        }
+      } catch (err) {
+        alert("Erro ao criar usuário: " + err.message);
+      }
+    });
+
+    const patchUser = async (id, body, confirmMsg) => {
+      if (confirmMsg && !confirm(confirmMsg)) return false;
+      try {
+        const res = await api(`/api/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+        if (res.temporary_password) state.newUserPassword = res.temporary_password;
+        state.users = (await api("/api/admin/users")).data || [];
+        render();
+        if (res.temporary_password) {
+          copyText(state.newUserPassword, null, "Nova senha temporária copiada!");
+        }
+        return true;
+      } catch (err) {
+        alert("Erro: " + err.message);
+        return false;
+      }
+    };
+
+    document.querySelectorAll("[data-user-role]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        const id = e.currentTarget.dataset.userRole;
+        const role = e.currentTarget.dataset.role;
+        await patchUser(id, { role: role === "admin" ? "user" : "admin" },
+          role === "admin" ? "Remover o papel de admin desta conta?" : "Tornar esta conta um admin?");
+      });
+    });
+
+    document.querySelectorAll("[data-user-status]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        const id = e.currentTarget.dataset.userStatus;
+        const status = e.currentTarget.dataset.status;
+        await patchUser(id, { status: status === "active" ? "disabled" : "active" },
+          status === "active" ? "Desativar esta conta? Todas as sessões serão encerradas." : "Reativar esta conta?");
+      });
+    });
+
+    document.querySelectorAll("[data-user-reset]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        const id = e.currentTarget.dataset.userReset;
+        await patchUser(id, { reset_password: true },
+          "Gerar uma nova senha temporária para esta conta? A atual deixa de funcionar e as sessões serão encerradas.");
+      });
+    });
+
+    document.querySelectorAll("[data-user-delete]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        const id = e.currentTarget.dataset.userDelete;
+        if (!confirm("Excluir esta conta permanentemente? Todos os dados do cofre dela serão apagados.")) return;
+        try {
+          await api(`/api/admin/users/${id}`, { method: "DELETE" });
+          state.users = (await api("/api/admin/users")).data || [];
+          render();
+          showToast("Conta excluída.");
+        } catch (err) {
+          alert("Erro ao excluir: " + err.message);
+        }
+      });
     });
   }
 

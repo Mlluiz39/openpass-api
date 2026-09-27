@@ -66,12 +66,5 @@ func TestListFiltersByResult(t *testing.T) {
 
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
-	database, err := opdb.Open(":memory:")
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	if err := opdb.Migrate(database, opdb.CoreSchema); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
-	}
-	return database
+	return opdb.OpenTest(t)
 }

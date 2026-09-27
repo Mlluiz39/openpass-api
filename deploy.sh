@@ -31,9 +31,42 @@ if [ -z "${OPENPASS_ADMIN_PASSWORD:-}" ]; then
   echo "       Para redefinir, use OPENPASS_ADMIN_PASSWORD_RESET=1 (veja o README)."
 fi
 
+# ------------------------------------------------------- docker compose path
+# When docker-compose.yml is present, the whole stack (Postgres + app) runs
+# in containers: tests need the db service up, then the app image is rebuilt
+# and restarted. This is the primary path on the VPS.
+if [ -f docker-compose.yml ] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  echo "==> Subindo Postgres (docker compose)..."
+  docker compose up -d db
+
+  if [ "${SKIP_TESTS:-0}" != "1" ]; then
+    echo "==> Rodando testes (contra o Postgres do compose)..."
+    go test ./...
+  else
+    echo "==> SKIP_TESTS=1, testes ignorados."
+  fi
+
+  echo "==> Build + restart do app..."
+  docker compose up -d --build app
+  sleep 2
+  if docker compose ps --status running app 2>/dev/null | grep -q app; then
+    echo "    app ativo"
+  else
+    echo "ERRO: app nao subiu. Veja: docker compose logs app --tail 50" >&2
+    exit 1
+  fi
+  echo
+  echo "Pronto. Acesse o painel e recarregue com Ctrl+Shift+R na primeira vez."
+  exit 0
+fi
+
 # -------------------------------------------------------------------- build
-echo "==> Rodando testes..."
-go test ./...
+if [ "${SKIP_TESTS:-0}" != "1" ]; then
+  echo "==> Rodando testes (requer Postgres em DATABASE_URL / OPENPASS_TEST_DATABASE_URL)..."
+  go test ./...
+else
+  echo "==> SKIP_TESTS=1, testes ignorados."
+fi
 
 echo "==> Compilando..."
 mkdir -p bin data

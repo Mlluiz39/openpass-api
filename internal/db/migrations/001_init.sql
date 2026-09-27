@@ -1,7 +1,13 @@
+-- OpenPass initial schema (PostgreSQL dialect).
+--
+-- Timestamps are TEXT written by the application in RFC3339 UTC, so the
+-- schema does not define DEFAULT CURRENT_TIMESTAMP: a timestamp default would
+-- need an explicit cast into TEXT and would produce a different format than
+-- the one the app writes, breaking ORDER BY created_at/updated_at.
 CREATE TABLE IF NOT EXISTS admin_sessions (
     id TEXT PRIMARY KEY,
     token_hash TEXT UNIQUE NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
 
@@ -20,16 +26,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
     is_active INTEGER NOT NULL DEFAULT 1,
     last_used_at TEXT,
     expires_at TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS vaults (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS entries (
@@ -40,8 +46,8 @@ CREATE TABLE IF NOT EXISTS entries (
     encrypted_value TEXT,
     metadata TEXT,
     tags TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
     UNIQUE(vault_id, path)
 );
@@ -52,7 +58,7 @@ CREATE TABLE IF NOT EXISTS backups (
     size_bytes INTEGER,
     format TEXT DEFAULT 'zip',
     status TEXT DEFAULT 'completed',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS api_audit_logs (
@@ -68,7 +74,7 @@ CREATE TABLE IF NOT EXISTS api_audit_logs (
     duration_ms INTEGER,
     result TEXT NOT NULL CHECK (result IN ('success', 'denied', 'error')),
     error_msg TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TEXT NOT NULL,
     FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE SET NULL
 );
 
@@ -82,6 +88,5 @@ CREATE INDEX IF NOT EXISTS idx_audit_ip ON api_audit_logs(ip_address);
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL
 );
-

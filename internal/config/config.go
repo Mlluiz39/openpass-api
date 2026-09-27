@@ -11,9 +11,10 @@ import (
 
 type Config struct {
 	Addr                   string
-	DatabasePath           string
+	DatabaseURL            string
 	SecretFile             string
 	SecretKey              string
+	AdminEmail             string
 	AdminPassword          string
 	GeneratedAdminPassword bool
 	ResetAdminPassword     bool
@@ -21,10 +22,11 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:         envOr("OPENPASS_ADDR", ":8080"),
-		DatabasePath: envOr("OPENPASS_DB_PATH", filepath.Join("data", "openpass.db")),
-		SecretFile:   envOr("OPENPASS_SECRET_FILE", filepath.Join("data", "openpass.secret")),
-		SecretKey:    strings.TrimSpace(os.Getenv("OPENPASS_SECRET_KEY")),
+		Addr:        envOr("OPENPASS_ADDR", ":8080"),
+		DatabaseURL: envOr("DATABASE_URL", "postgres://openpass:openpass@localhost:5432/openpass?sslmode=disable"),
+		SecretFile:  envOr("OPENPASS_SECRET_FILE", filepath.Join("data", "openpass.secret")),
+		SecretKey:   strings.TrimSpace(os.Getenv("OPENPASS_SECRET_KEY")),
+		AdminEmail:  envOr("OPENPASS_ADMIN_EMAIL", "admin@openpass.local"),
 	}
 
 	if cfg.SecretKey == "" {

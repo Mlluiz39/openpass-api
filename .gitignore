@@ -16,6 +16,11 @@ backups/
 # Release artifacts (use GitHub Releases instead)
 release/
 
+# Local environment (credentials — never commit)
+.env
+.env.*
+!.env.example
+
 # Obsolete prototypes / recursive copies
 nested/
 openpass-api/
