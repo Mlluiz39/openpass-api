@@ -25,9 +25,10 @@ services:
       db:
         condition: service_healthy
     environment:
-      # Set DATABASE_URL in .env to override the default below (e.g. to add
-      # sslmode or a non-default user).
-      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-openpass}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-openpass}?sslmode=disable}
+      # Inside the compose network the database is reached by its service name
+      # (db), not localhost. Set OPENPASS_DOCKER_DATABASE_URL in .env to
+      # override (e.g. to add sslmode or a non-default user).
+      DATABASE_URL: ${OPENPASS_DOCKER_DATABASE_URL:-postgres://${POSTGRES_USER:-openpass}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-openpass}?sslmode=disable}
       OPENPASS_ADMIN_EMAIL: ${OPENPASS_ADMIN_EMAIL:-admin@openpass.local}
       OPENPASS_ADMIN_PASSWORD: ${OPENPASS_ADMIN_PASSWORD:-}
       OPENPASS_SECRET_KEY: ${OPENPASS_SECRET_KEY:-}
