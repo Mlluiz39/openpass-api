@@ -129,6 +129,10 @@ button, input, select, textarea {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  /* The header carries eight actions. Wrapping is the only graceful way to
+     degrade: without it the row pushes the whole page wider than the viewport
+     at any width short of a desktop (measured 832px of buttons at 768px). */
+  flex-wrap: wrap;
 }
 
 .brand {
@@ -177,6 +181,8 @@ button, input, select, textarea {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 /* Buttons */
@@ -370,7 +376,9 @@ button, input, select, textarea {
 /* Items Grid */
 .items-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  /* min() keeps a single column from forcing a horizontal scrollbar on a
+     narrow screen, where 330px plus the page padding would exceed the width. */
+  grid-template-columns: repeat(auto-fill, minmax(min(330px, 100%), 1fr));
   gap: 14px;
 }
 
@@ -385,6 +393,11 @@ button, input, select, textarea {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  /* A grid track sized minmax(auto, 1fr) takes its minimum from the items'
+     min-content, so one card holding a 200-character URL would stretch the
+     single column (and every card in it) past the screen. min-width:0 stops
+     that: long values ellipsize or wrap instead of widening the layout. */
+  min-width: 0;
 }
 
 .vault-card:hover {
@@ -404,6 +417,7 @@ button, input, select, textarea {
   align-items: center;
   gap: 10px;
   min-width: 0;
+  flex: 1;
 }
 
 .card-type-icon {
@@ -424,6 +438,21 @@ button, input, select, textarea {
 .type-note { color: var(--type-note); background: var(--type-note-bg); }
 
 .card-name-group {
+  min-width: 0;
+  flex: 1;
+}
+
+/* Every text box that can hold a URL, an e-mail or a generated password gets
+   an explicit break opportunity. Without it, a single long value is enough to
+   widen a grid track (and with it the whole page) past the viewport. */
+.card-title,
+.card-subtitle,
+.card-subtitle a,
+.card-field-value,
+.card-secret-val,
+.notes-box,
+.recovery-key-text {
+  overflow-wrap: anywhere;
   min-width: 0;
 }
 
@@ -926,8 +955,29 @@ button, input, select, textarea {
     grid-template-columns: 1fr;
   }
 
+  /* The header carries a lot of actions; on a phone they no longer fit on one
+     line, so the row wraps and each button keeps a 40px target. Two rows of
+     icons are better than actions that run off the edge. */
   .header-inner {
     padding: 10px 14px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .header-actions {
+    flex-wrap: wrap;
+    gap: 6px;
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .header-actions .btn {
+    padding: 8px 10px;
+  }
+
+  .header-actions .btn-icon {
+    width: 40px;
+    height: 40px;
   }
 
   .brand-title {
@@ -938,17 +988,144 @@ button, input, select, textarea {
     display: none;
   }
 
-  /* The header carries a lot of actions; on a phone only the icon remains. */
+  /* Icon-only header on a phone: the label span is hidden. */
   .hide-mobile {
     display: none;
   }
 
-  .header-actions {
-    gap: 6px;
+  .search-container,
+  .categories-wrap,
+  .main-content {
+    padding: 0 12px;
+  }
+
+  /* A long URL, e-mail or generated password must wrap instead of pushing the
+     card wider than the screen. A 200-character link imported from Chrome was
+     stretching the whole column to ~695px on a 390px phone. */
+  .card-title,
+  .card-field-value,
+  .card-subtitle,
+  .card-subtitle a,
+  .card-secret-val,
+  .notes-box {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    text-align: left;
+  }
+
+  .card-secret-row {
+    flex-wrap: wrap;
+  }
+
+  .card-field-row {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  /* The actions row has up to four controls; let them wrap rather than shrink
+     below a tappable size. */
+  .card-actions {
+    flex-wrap: wrap;
+  }
+
+  .card-copy-btn {
+    min-width: 120px;
+  }
+
+  /* iOS zooms the whole page when a field with font-size below 16px gets
+     focus, which reads as the layout "breaking" the moment the user taps a
+     password box. 16px is what prevents that zoom — applied to every control,
+     because the modal mixes classed and unclassed inputs. */
+  input,
+  select,
+  textarea,
+  .form-input,
+  .form-textarea,
+  .form-select,
+  .search-input,
+  .password-input-wrap .form-input {
+    font-size: 16px;
+  }
+
+  /* Touch targets: a finger needs ~44px. Icon buttons inside cards were 29px
+     and the header icons 36px tall, which is why taps kept missing. */
+  .icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .btn {
+    min-height: 40px;
+  }
+
+  .category-pill {
+    min-height: 40px;
   }
 
   .header-actions .btn {
-    padding: 8px 10px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .card-actions {
+    gap: 8px;
+  }
+
+  /* The copy button and the URL link inside each card were 31px and 36px tall,
+     below the ~44px a finger reliably hits. */
+  .card-copy-btn {
+    min-height: 44px;
+  }
+
+  .card-subtitle a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+
+  .brand {
+    min-height: 44px;
+  }
+
+  .pass-tool-btn {
+    min-height: 44px;
+    padding: 8px 12px;
+  }
+
+  /* Modal footer buttons stack so both stay full-width and tappable. */
+  .modal-footer {
+    flex-wrap: wrap;
+  }
+
+  .modal-footer .btn {
+    flex: 1;
+  }
+
+  .modal-body {
+    padding: 16px;
+  }
+
+  .modal-header {
+    padding: 14px 16px;
+  }
+
+  .recovery-key-card {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .recovery-key-text {
+    font-size: 13px;
+  }
+
+  .toast {
+    max-width: calc(100vw - 32px);
+    text-align: center;
+  }
+
+  .empty-state {
+    padding: 40px 16px;
   }
 
   .btn-install {
@@ -1019,6 +1196,8 @@ button, input, select, textarea {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  /* Inline links still need a finger-sized hit area on a phone. */
+  min-height: 44px;
 }
 
 .link-btn:hover {
