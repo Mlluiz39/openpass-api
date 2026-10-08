@@ -11,10 +11,17 @@ const state = {
   activeCategory: "all",
   searchQuery: "",
   revealed: {},
+  // Per-entry 2FA codes, keyed by entry id: { code, seconds_remaining, period }.
+  totp: {},
   copiedKey: null,
   expanded: {},
   modal: null, // { mode: 'create' | 'edit', item?: Entry, selectedType?: string, form?: object }
   backupModalOpen: false,
+  chromeImportModalOpen: false,
+  chromeImportResult: null,
+  generatorModalOpen: false,
+  generatorResult: null,
+  generatorOptions: { length: 20, lower: true, upper: true, digits: true, symbols: true, exclude_ambiguous: false },
   securityModalOpen: false,
   recoveryKey: null,
   recoveryView: false,
@@ -501,6 +508,12 @@ function render() {
           <button class="btn btn-ghost" id="btnBackup" title="Backup e restauração">
             <span>💾</span> <span class="hide-mobile">Backup</span>
           </button>
+          <button class="btn btn-ghost" id="btnImport" title="Importar senhas do Google Chrome">
+            <span>📥</span> <span class="hide-mobile">Importar</span>
+          </button>
+          <button class="btn btn-ghost" id="btnGenerator" title="Gerar uma senha forte">
+            <span>🎲</span> <span class="hide-mobile">Gerador</span>
+          </button>
           <button class="btn btn-ghost btn-icon" id="btnTheme" title="Alternar tema">
             ${state.theme === "dark" ? "☀️" : "🌙"}
           </button>
@@ -553,6 +566,8 @@ function render() {
 
     ${state.modal ? renderItemModal() : ""}
     ${state.backupModalOpen ? renderBackupModal() : ""}
+    ${state.chromeImportModalOpen ? renderChromeImportModal() : ""}
+    ${state.generatorModalOpen ? renderGeneratorModal() : ""}
     ${state.securityModalOpen ? renderSecurityModal() : ""}
     ${state.usersModalOpen ? renderUsersModal() : ""}
   `;
@@ -766,6 +781,22 @@ function renderCard(item) {
         </div>
       ` : ""}
 
+      ${item.has_totp ? `
+        <div class="card-fields">
+          <div class="card-secret-row">
+            <span class="card-field-label">Código 2FA</span>
+            <span class="card-secret-val mono" data-totp-code="${item.id}">
+              ${state.totp[item.id] ? escapeHTML(state.totp[item.id].code) : "••••••"}
+            </span>
+            <span style="color:var(--text-dim);font-size:11px;" data-totp-timer="${item.id}">
+              ${state.totp[item.id] ? state.totp[item.id].seconds_remaining + "s" : ""}
+            </span>
+            <button class="icon-btn" data-totp="${item.id}" title="Gerar código 2FA">🔐</button>
+            <button class="icon-btn" data-totp-copy="${item.id}" title="Copiar código">📋</button>
+          </div>
+        </div>
+      ` : ""}
+
       <div class="card-actions">
         <button class="card-copy-btn ${isCopiedPrimary ? "copied" : ""}" data-copy-secret="${item.id}">
           ${isCopiedPrimary ? "✓ Copiado!" : `📋 ${primaryCopyLabel}`}
@@ -869,6 +900,15 @@ function renderItemModal() {
             <div class="form-group">
               <label class="form-label">Endereço do Site (URL)</label>
               <input class="form-input" name="meta_url" placeholder="https://exemplo.com/login" value="${escapeHTML(field("meta_url", meta.url || ""))}" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">Segredo 2FA / Autenticador (opcional)</label>
+              <input class="form-input mono" name="totp_secret" placeholder="Cole a chave base32 ou o link otpauth://" value="${escapeHTML(field("totp_secret", ""))}" />
+              <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">
+                ${item && item.has_totp
+                  ? "Já existe um segredo salvo. Deixe em branco para manter, ou cole outro para substituir."
+                  : "Gera o código de 6 dígitos aqui mesmo, sem app no celular."}
+              </div>
             </div>
           ` : ""}
 
@@ -1108,6 +1148,93 @@ function renderUsersModal() {
   `;
 }
 
+// Password generator, mirroring Bitwarden's: length, character classes and an
+// "avoid ambiguous characters" switch, with a live entropy estimate.
+function renderGeneratorModal() {
+  const opts = state.generatorOptions || {};
+  const result = state.generatorResult;
+  return `
+    <div class="modal-overlay" id="generatorBackdrop">
+      <div class="modal-content" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3 class="modal-title">Gerador de Senha</h3>
+          <button class="icon-btn" id="generatorClose">✕</button>
+        </div>
+        <div class="modal-body">
+          <section style="display:flex;flex-direction:column;gap:14px;">
+            <div style="display:flex;gap:8px;align-items:center;">
+              <input class="form-input mono" id="generatorOutput" type="text" readonly
+                     value="${result ? escapeHTML(result.password) : ""}"
+                     placeholder="Clique em Gerar" style="flex:1;font-size:15px;" />
+              <button class="icon-btn" id="generatorCopy" title="Copiar">📋</button>
+            </div>
+            <p style="font-size:12px;color:var(--text-muted);margin:0;">
+              ${result ? `Força estimada: <strong>${result.strength} bits</strong>` : "&nbsp;"}
+            </p>
+
+            <div class="form-group">
+              <label class="form-label">Comprimento: <span id="generatorLengthLabel">${opts.length || 20}</span></label>
+              <input type="range" id="generatorLength" min="8" max="64" value="${opts.length || 20}" style="width:100%;" />
+            </div>
+
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px;">
+              <label><input type="checkbox" id="gen_lower" ${opts.lower !== false ? "checked" : ""} /> Minúsculas</label>
+              <label><input type="checkbox" id="gen_upper" ${opts.upper !== false ? "checked" : ""} /> Maiúsculas</label>
+              <label><input type="checkbox" id="gen_digits" ${opts.digits !== false ? "checked" : ""} /> Números</label>
+              <label><input type="checkbox" id="gen_symbols" ${opts.symbols !== false ? "checked" : ""} /> Símbolos</label>
+            </div>
+            <label style="font-size:13px;">
+              <input type="checkbox" id="gen_ambiguous" ${opts.exclude_ambiguous ? "checked" : ""} />
+              Evitar caracteres ambíguos (l, 1, I, O, 0)
+            </label>
+
+            <button class="btn btn-primary" id="generatorGenerate">Gerar senha</button>
+          </section>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" id="generatorCancel">Fechar</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// requestTOTP fetches a fresh 2FA code and stores it on the entry, then repaints
+// only the affected card bits.
+async function requestTOTP(entryId) {
+  try {
+    const res = await api(`/api/admin/entries/${entryId}/code`);
+    state.totp[entryId] = res;
+    render();
+  } catch (err) {
+    alert("Não consegui gerar o código: " + err.message);
+  }
+}
+
+// --- TOTP ticker: refresh the seconds countdown and roll the code over.
+if (!window.__openpassTotpTicker) {
+  window.__openpassTotpTicker = setInterval(() => {
+    const ids = Object.keys(state.totp || {});
+    if (!ids.length) return;
+    let needsRender = false;
+    ids.forEach((id) => {
+      const t = state.totp[id];
+      if (!t) return;
+      t.seconds_remaining -= 1;
+      if (t.seconds_remaining <= 0) {
+        needsRender = true;
+        api(`/api/admin/entries/${id}/code`)
+          .then((res) => { state.totp[id] = res; render(); })
+          .catch(() => {});
+        return;
+      }
+      const timer = document.querySelector(`[data-totp-timer="${id}"]`);
+      if (timer) timer.textContent = t.seconds_remaining + "s";
+    });
+    if (needsRender) render();
+  }, 1000);
+}
+
 function renderBackupModal() {
   return `
     <div class="modal-overlay" id="backupModalBackdrop">
@@ -1165,6 +1292,80 @@ function renderBackupModal() {
   `;
 }
 
+// Chrome's password manager exports a CSV with these columns; the import runs
+// entirely through the session API, so nothing is written to the server's disk.
+function renderChromeImportModal() {
+  const result = state.chromeImportResult;
+  return `
+    <div class="modal-overlay" id="chromeImportBackdrop">
+      <div class="modal-content" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3 class="modal-title">Importar do Google Chrome</h3>
+          <button class="icon-btn" id="chromeImportClose">✕</button>
+        </div>
+
+        <div class="modal-body">
+          <section style="display:flex;flex-direction:column;gap:12px;">
+            <p style="font-size:13px;color:var(--text-muted);">
+              Exporte suas senhas do Chrome em <strong>chrome://password-manager</strong> →
+              <em>Configurações</em> → <em>Baixar arquivo</em>, e selecione o
+              <strong>.csv</strong> aqui. Cada senha vira um registro do tipo
+              <strong>login</strong> no seu cofre. Nada é enviado para fora deste servidor,
+              e o arquivo não é gravado em disco.
+            </p>
+            <form id="chromeImportForm" style="display:flex;flex-direction:column;gap:10px;">
+              <div class="form-group">
+                <label class="form-label">Arquivo CSV do Chrome</label>
+                <input class="form-input" type="file" name="file" accept=".csv,text/csv" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Cofre de destino</label>
+                <input class="form-input" type="text" name="vault" placeholder="Principal" />
+              </div>
+              <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+                <input type="checkbox" name="dry_run" />
+                Só simular (mostra o que seria importado, sem gravar)
+              </label>
+              <button class="btn btn-primary" type="submit">Importar agora</button>
+            </form>
+          </section>
+
+          ${result ? `
+            <hr style="border:none;border-top:1px solid var(--border-subtle);margin:8px 0;" />
+            <section style="display:flex;flex-direction:column;gap:8px;">
+              <h4 style="font-size:15px;font-weight:700;">
+                ${result.dry_run ? "Simulação" : "Importação concluída"}
+              </h4>
+              <p style="font-size:13px;">
+                <strong>${result.imported}</strong> ${result.dry_run ? "seriam importados" : "importados"} ·
+                <strong>${result.skipped}</strong> pulados ·
+                <strong>${result.failed}</strong> com falha
+              </p>
+              <p style="font-size:12px;color:var(--text-muted);">
+                Cofre: <strong>${escapeHTML(result.vault_name)}</strong>
+              </p>
+              ${result.names && result.names.length ? `
+                <div style="max-height:180px;overflow:auto;border:1px solid var(--border-subtle);border-radius:8px;padding:8px;">
+                  ${result.names.map((n) => `<div style="font-size:12px;">• ${escapeHTML(n)}</div>`).join("")}
+                </div>
+              ` : ""}
+              ${result.errors && result.errors.length ? `
+                <div style="max-height:140px;overflow:auto;color:var(--danger);font-size:12px;">
+                  ${result.errors.map((e) => `<div>• ${escapeHTML(e)}</div>`).join("")}
+                </div>
+              ` : ""}
+            </section>
+          ` : ""}
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" id="chromeImportCancel">Fechar</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 // Closing on "click" alone also fires when a text selection starts inside the
 // modal and ends over the backdrop, which silently discarded a half-typed
 // record. Only a press that both starts and ends on the backdrop closes it.
@@ -1194,6 +1395,16 @@ function closeTopModal() {
   }
   if (state.backupModalOpen) {
     state.backupModalOpen = false;
+    render();
+    return true;
+  }
+  if (state.chromeImportModalOpen) {
+    state.chromeImportModalOpen = false;
+    render();
+    return true;
+  }
+  if (state.generatorModalOpen) {
+    state.generatorModalOpen = false;
     render();
     return true;
   }
@@ -1319,6 +1530,11 @@ function attachEvents() {
     state.user = null;
     state.users = [];
     state.usersModalOpen = false;
+    state.chromeImportModalOpen = false;
+    state.chromeImportResult = null;
+    state.totp = {};
+    state.generatorModalOpen = false;
+    state.generatorResult = null;
     renderLogin();
   });
 
@@ -1329,6 +1545,84 @@ function attachEvents() {
 
   document.querySelector("#btnBackup")?.addEventListener("click", () => {
     state.backupModalOpen = true;
+    render();
+  });
+
+  document.querySelector("#btnGenerator")?.addEventListener("click", () => {
+    state.generatorModalOpen = true;
+    render();
+  });
+
+  document.querySelectorAll("[data-totp]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      requestTOTP(btn.dataset.totp);
+    });
+  });
+
+  document.querySelectorAll("[data-totp-copy]").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.totpCopy;
+      if (!state.totp[id]) await requestTOTP(id);
+      const t = state.totp[id];
+      if (t) copyText(t.code, `totp_${id}`, "Código 2FA copiado!");
+    });
+  });
+
+  // Password generator modal
+  if (state.generatorModalOpen) {
+    const closeGenerator = () => {
+      state.generatorModalOpen = false;
+      render();
+    };
+    document.querySelector("#generatorClose")?.addEventListener("click", closeGenerator);
+    document.querySelector("#generatorCancel")?.addEventListener("click", closeGenerator);
+    bindOverlayClose("#generatorBackdrop", closeGenerator);
+
+    const lengthInput = document.querySelector("#generatorLength");
+    lengthInput?.addEventListener("input", () => {
+      const label = document.querySelector("#generatorLengthLabel");
+      if (label) label.textContent = lengthInput.value;
+    });
+
+    const readOptions = () => ({
+      length: Number(document.querySelector("#generatorLength")?.value || 20),
+      lower: !!document.querySelector("#gen_lower")?.checked,
+      upper: !!document.querySelector("#gen_upper")?.checked,
+      digits: !!document.querySelector("#gen_digits")?.checked,
+      symbols: !!document.querySelector("#gen_symbols")?.checked,
+      exclude_ambiguous: !!document.querySelector("#gen_ambiguous")?.checked,
+    });
+
+    document.querySelector("#generatorGenerate")?.addEventListener("click", async () => {
+      const options = readOptions();
+      state.generatorOptions = options;
+      const qs = new URLSearchParams({
+        length: options.length,
+        lower: options.lower,
+        upper: options.upper,
+        digits: options.digits,
+        symbols: options.symbols,
+        exclude_ambiguous: options.exclude_ambiguous,
+      });
+      try {
+        state.generatorResult = await api(`/api/admin/password/generate?${qs}`);
+        render();
+      } catch (err) {
+        alert("Não consegui gerar a senha: " + err.message);
+      }
+    });
+
+    document.querySelector("#generatorCopy")?.addEventListener("click", () => {
+      const out = document.querySelector("#generatorOutput");
+      if (out && out.value) copyText(out.value, null, "Senha copiada!");
+    });
+  }
+
+  document.querySelector("#btnImport")?.addEventListener("click", () => {
+    state.chromeImportModalOpen = true;
+    state.chromeImportResult = null;
     render();
   });
 
@@ -1426,9 +1720,15 @@ function attachEvents() {
         }
       }
 
+      // The authenticator secret travels on its own endpoint (and its own
+      // column), so it is saved after the entry exists — on create, the entry
+      // id only becomes known once the POST above returns.
+      const totpSecret = String(data.get("totp_secret") || "").trim();
+
       try {
+        let entryId = state.modal.item?.id;
         if (state.modal.mode === "create") {
-          await api("/api/admin/entries", {
+          const created = await api("/api/admin/entries", {
             method: "POST",
             body: JSON.stringify({
               path,
@@ -1437,6 +1737,7 @@ function attachEvents() {
               metadata,
             }),
           });
+          entryId = created?.entry?.id || created?.data?.id || created?.id;
           showToast("Salvo no cofre com sucesso!");
         } else {
           await api(`/api/admin/entries/${state.modal.item.id}`, {
@@ -1450,6 +1751,14 @@ function attachEvents() {
           });
           showToast("Registro atualizado com sucesso!");
         }
+
+        if (entryId && totpSecret) {
+          await api(`/api/admin/entries/${entryId}/totp`, {
+            method: "PUT",
+            body: JSON.stringify({ secret: totpSecret }),
+          });
+        }
+
         state.modal = null;
         await loadData();
         render();
@@ -1704,6 +2013,49 @@ function attachEvents() {
         render();
       } catch (err) {
         alert("Erro na restauração: " + err.message);
+      }
+    });
+  }
+
+  // Chrome import modal
+  if (state.chromeImportModalOpen) {
+    const closeImport = () => {
+      state.chromeImportModalOpen = false;
+      render();
+    };
+    document.querySelector("#chromeImportClose")?.addEventListener("click", closeImport);
+    document.querySelector("#chromeImportCancel")?.addEventListener("click", closeImport);
+    bindOverlayClose("#chromeImportBackdrop", closeImport);
+
+    document.querySelector("#chromeImportForm")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const form = e.currentTarget;
+      const data = new FormData(form);
+      const file = data.get("file");
+      if (!file || !file.size) {
+        showToast("Selecione o arquivo CSV exportado do Chrome.", "info");
+        return;
+      }
+      try {
+        const csv = await file.text();
+        const res = await api("/api/admin/import/chrome", {
+          method: "POST",
+          body: JSON.stringify({
+            csv,
+            vault: data.get("vault") || "",
+            dry_run: data.get("dry_run") !== null,
+          }),
+        });
+        state.chromeImportResult = res;
+        if (res.dry_run) {
+          showToast(`${res.imported} registro(s) seriam importados.`);
+        } else {
+          showToast(`${res.imported} senha(s) importada(s) para o cofre.`);
+          await loadData();
+        }
+        render();
+      } catch (err) {
+        alert("Erro na importação: " + err.message);
       }
     });
   }

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        width: 330px; margin: 0; padding: 14px;
+        background: #15161c; color: #e8e9ef;
+        font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      h1 { font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+      .badge { font-size: 11px; padding: 2px 6px; border-radius: 999px; background: #21232c; color: #9aa0b4; }
+      .item {
+        display: flex; flex-direction: column; gap: 2px; flex: 1; text-align: left;
+        padding: 9px 10px; border-radius: 8px; cursor: pointer;
+        background: #1c1e26; border: 1px solid #2c2e39; color: inherit; font: inherit;
+      }
+      .row { display: flex; gap: 6px; margin-bottom: 6px; align-items: stretch; }
+      .totp {
+        padding: 0 10px; border-radius: 8px; cursor: pointer; font-size: 16px;
+        background: #1c1e26; border: 1px solid #2c2e39; color: inherit;
+      }
+      .totp:hover { background: #21232c; }
+      #codePanel {
+        display: none; margin: 4px 0 10px; padding: 10px; border-radius: 8px;
+        background: #1c1e26; border: 1px solid #2c2e39;
+      }
+      #codePanel .code {
+        display: block; width: 100%; margin: 4px 0; padding: 6px; cursor: pointer;
+        background: none; border: 0; color: #e8e9ef; font: 700 24px/1.2 "SFMono-Regular", Consolas, monospace;
+        letter-spacing: 2px;
+      }
+      .item:hover { background: #21232c; }
+      .name { font-weight: 600; }
+      .user { color: #9aa0b4; font-size: 12px; }
+      .empty, .error { color: #9aa0b4; font-size: 12px; padding: 8px 0; }
+      .error { color: #ff8080; }
+      button.link {
+        background: none; border: 0; color: #7aa2ff; cursor: pointer;
+        font: inherit; padding: 0; text-decoration: underline;
+      }
+      .footer { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <h1>OpenPass <span class="badge" id="status">…</span></h1>
+    <div id="codePanel"></div>
+    <div id="list"></div>
+    <div class="footer">
+      <button class="link" id="openOptions">Configurar</button>
+      <button class="link" id="reload">Recarregar</button>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

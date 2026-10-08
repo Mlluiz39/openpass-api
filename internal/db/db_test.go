@@ -54,16 +54,9 @@ func TestForeignKeysEnforced(t *testing.T) {
 
 func TestIsUniqueViolationDetectsSQLState23505(t *testing.T) {
 	database := OpenTest(t)
-	// vaults.owner_id is NOT NULL since the multi-user migration, so the
-	// duplicate-name test needs an owner first.
-	if _, err := database.Exec(
-		`INSERT INTO users(id, email, password_hash, created_at, updated_at) VALUES($1,$2,$3,$4,$4)`,
-		"u1", "dup-test@openpass.local", "argon2id$test", now(),
-	); err != nil {
-		t.Fatalf("insert owner: %v", err)
-	}
-	stmt := `INSERT INTO vaults(id, owner_id, name, description, created_at, updated_at) VALUES($1,$2,$3,$4,$5,$5)`
-	args := []any{"v1", "u1", "dup", "", now()}
+	owner := insertTestUser(t, database, "uniq-owner")
+	stmt := `INSERT INTO vaults(id, name, description, owner_id, created_at, updated_at) VALUES($1,$2,$3,$4,$5,$6)`
+	args := []any{"v1", "dup", "", owner, now(), now()}
 
 	if _, err := database.Exec(stmt, args...); err != nil {
 		t.Fatalf("first insert: %v", err)
@@ -97,4 +90,17 @@ func assertTableExists(t *testing.T, database *sql.DB, table string) {
 
 func now() string {
 	return time.Now().UTC().Format(time.RFC3339)
+}
+
+// insertTestUser creates the owner row a vault has to point at.
+func insertTestUser(t *testing.T, database *sql.DB, id string) string {
+	t.Helper()
+	_, err := database.Exec(`INSERT INTO users(id, email, password_hash, role, status, must_change_password, created_at, updated_at)
+		VALUES($1, $2, 'argon2id$test', 'user', 'active', 0, $3, $3)`,
+		id, id+"@test.local", now(),
+	)
+	if err != nil {
+		t.Fatalf("insert test user: %v", err)
+	}
+	return id
 }

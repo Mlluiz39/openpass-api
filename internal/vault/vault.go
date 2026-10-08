@@ -49,14 +49,17 @@ type EntryInput struct {
 }
 
 type Entry struct {
-	ID        string            `json:"id"`
-	VaultID   string            `json:"vault_id"`
-	Path      string            `json:"path"`
-	Type      string            `json:"type"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
-	Tags      []string          `json:"tags,omitempty"`
-	CreatedAt string            `json:"created_at"`
-	UpdatedAt string            `json:"updated_at"`
+	ID       string            `json:"id"`
+	VaultID  string            `json:"vault_id"`
+	Path     string            `json:"path"`
+	Type     string            `json:"type"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+	Tags     []string          `json:"tags,omitempty"`
+	// HasTOTP tells the UI whether a one-time-password secret is stored for
+	// this entry, without ever exposing the secret itself.
+	HasTOTP   bool   `json:"has_totp"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 func New(database *sql.DB, secret string) *Service {
@@ -280,7 +283,7 @@ func (s *Service) ListEntriesForAPI(ctx context.Context, key *apikeys.Authentica
 }
 
 func (s *Service) listEntries(ctx context.Context, ownerID, vaultID string, scope []string) ([]Entry, error) {
-	query := `SELECT e.id, e.vault_id, e.path, e.type, e.metadata, e.tags, e.created_at, e.updated_at
+	query := `SELECT e.id, e.vault_id, e.path, e.type, e.metadata, e.tags, (e.encrypted_totp IS NOT NULL AND e.encrypted_totp <> '') AS has_totp, e.created_at, e.updated_at
 		FROM entries e JOIN vaults v ON v.id = e.vault_id WHERE v.owner_id = $1`
 	args := []any{ownerID}
 	if strings.TrimSpace(vaultID) != "" {
@@ -341,6 +344,7 @@ func (s *Service) RegisterAPIRoutes(mux *http.ServeMux, keys *apikeys.Service) {
 	mux.Handle("GET /api/v1/vaults", keys.RequirePermission("vaults:read", http.HandlerFunc(s.APIListVaults)))
 	mux.Handle("GET /api/v1/vaults/{id}", keys.RequirePermission("vaults:read", http.HandlerFunc(s.APIGetVault)))
 	mux.Handle("GET /api/v1/entries", keys.RequirePermission("entries:read", http.HandlerFunc(s.APIListEntries)))
+	mux.Handle("GET /api/v1/entries/match", keys.RequirePermission("entries:read", http.HandlerFunc(s.APIMatchEntries)))
 	mux.Handle("GET /api/v1/entries/{id}", keys.RequirePermission("entries:read", http.HandlerFunc(s.APIGetEntry)))
 	mux.Handle("POST /api/v1/entries", keys.RequirePermission("entries:write", http.HandlerFunc(s.APICreateEntry)))
 	mux.Handle("PUT /api/v1/entries/{id}", keys.RequirePermission("entries:write", http.HandlerFunc(s.APIUpdateEntry)))
@@ -541,13 +545,48 @@ func (s *Service) APIListEntries(w http.ResponseWriter, r *http.Request) {
 	httpjson.Write(w, http.StatusOK, map[string]any{"data": entries})
 }
 
+// APIMatchEntries answers, for a URL the extension is looking at, which saved
+// logins belong to that site. It never returns secrets unless reveal=1, and
+// then only for entries the caller's key may access.
+func (s *Service) APIMatchEntries(w http.ResponseWriter, r *http.Request) {
+	key, _ := apikeys.FromContext(r.Context())
+	target := strings.TrimSpace(r.URL.Query().Get("url"))
+	if target == "" {
+		httpjson.Error(w, http.StatusBadRequest, "url_required")
+		return
+	}
+	reveal := r.URL.Query().Get("reveal") == "1"
+
+	matches, err := s.MatchEntries(r.Context(), key.OwnerID, target, false)
+	if err != nil {
+		httpjson.Error(w, http.StatusInternalServerError, "match_entries_failed")
+		return
+	}
+	// The key's vault scope applies on top of ownership, exactly as it does
+	// for the entry list.
+	scoped := matches[:0]
+	for _, m := range matches {
+		if key.CanAccessVault(m.Entry.VaultID) {
+			scoped = append(scoped, m)
+		}
+	}
+	matches = scoped
+
+	if reveal {
+		for i := range matches {
+			value, err := s.RevealEntry(r.Context(), key.OwnerID, matches[i].Entry.ID)
+			if err != nil {
+				continue
+			}
+			matches[i].Value = value
+		}
+	}
+	httpjson.Write(w, http.StatusOK, map[string]any{"data": matches})
+}
+
 func (s *Service) APIGetEntry(w http.ResponseWriter, r *http.Request) {
 	key, _ := apikeys.FromContext(r.Context())
 	entry, err := s.getEntry(r.Context(), key.OwnerID, r.PathValue("id"))
-	if err != nil {
-		httpjson.Error(w, http.StatusNotFound, "not_found")
-		return
-	}
 	if !key.CanAccessVault(entry.VaultID) {
 		httpjson.Error(w, http.StatusForbidden, "forbidden")
 		return
@@ -636,8 +675,14 @@ func (s *Service) getVault(ctx context.Context, ownerID, id string) (Vault, erro
 	return scanVault(row)
 }
 
+// GetEntry is the exported form of getEntry, used by the authenticator and any
+// other package that has to verify ownership before reading an entry.
+func (s *Service) GetEntry(ctx context.Context, ownerID, id string) (Entry, error) {
+	return s.getEntry(ctx, ownerID, id)
+}
+
 func (s *Service) getEntry(ctx context.Context, ownerID, id string) (Entry, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT e.id, e.vault_id, e.path, e.type, e.metadata, e.tags, e.created_at, e.updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT e.id, e.vault_id, e.path, e.type, e.metadata, e.tags, (e.encrypted_totp IS NOT NULL AND e.encrypted_totp <> '') AS has_totp, e.created_at, e.updated_at
 		FROM entries e JOIN vaults v ON v.id = e.vault_id
 		WHERE e.id = $1 AND v.owner_id = $2`, id, ownerID)
 	return scanEntry(row)
@@ -660,7 +705,7 @@ func scanVault(row scanner) (Vault, error) {
 func scanEntry(row scanner) (Entry, error) {
 	var entry Entry
 	var metadataRaw, tagsRaw sql.NullString
-	if err := row.Scan(&entry.ID, &entry.VaultID, &entry.Path, &entry.Type, &metadataRaw, &tagsRaw, &entry.CreatedAt, &entry.UpdatedAt); err != nil {
+	if err := row.Scan(&entry.ID, &entry.VaultID, &entry.Path, &entry.Type, &metadataRaw, &tagsRaw, &entry.HasTOTP, &entry.CreatedAt, &entry.UpdatedAt); err != nil {
 		return Entry{}, err
 	}
 	entry.Metadata = unmarshalObject(metadataRaw.String)

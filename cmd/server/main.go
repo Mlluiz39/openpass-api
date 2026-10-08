@@ -13,11 +13,14 @@ import (
 	"github.com/openpass/api/internal/admin"
 	"github.com/openpass/api/internal/apikeys"
 	"github.com/openpass/api/internal/audit"
+	"github.com/openpass/api/internal/authenticator"
 	"github.com/openpass/api/internal/backup"
 	"github.com/openpass/api/internal/bitwarden"
+	"github.com/openpass/api/internal/chromeimport"
 	"github.com/openpass/api/internal/config"
 	opdb "github.com/openpass/api/internal/db"
 	"github.com/openpass/api/internal/httpjson"
+	"github.com/openpass/api/internal/secure"
 	"github.com/openpass/api/internal/vault"
 	"github.com/openpass/api/internal/web"
 )
@@ -60,6 +63,7 @@ func main() {
 	keySvc.SetAudit(auditSvc)
 	vaultSvc := vault.New(database, cfg.SecretKey)
 	backupSvc := backup.New(database, cfg.SecretKey)
+	authSvc := authenticator.New(database, vaultSvc, secure.NewBox(cfg.SecretKey))
 
 	mux := http.NewServeMux()
 	adminSvc.RegisterRoutes(mux)
@@ -69,6 +73,9 @@ func main() {
 	auditSvc.RegisterAdminRoutes(mux, adminSvc.Require)
 	backupSvc.RegisterAdminRoutes(mux, adminSvc.Require)
 	vaultSvc.RegisterAdminRoutes(mux, adminSvc.Require)
+	mux.Handle("POST /api/admin/import/chrome", adminSvc.Require(chromeimport.Handler(vaultSvc)))
+	authSvc.RegisterAdminRoutes(mux, adminSvc.Require)
+	authSvc.RegisterAPIRoutes(mux, keySvc)
 	vaultSvc.RegisterAPIRoutes(mux, keySvc)
 	registerBackupRoutes(mux, backupSvc, keySvc)
 	bwSvc.RegisterRoutes(mux)
