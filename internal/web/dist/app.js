@@ -25,6 +25,11 @@ const state = {
   securityModalOpen: false,
   recoveryKey: null,
   recoveryView: false,
+  apiKeysModalOpen: false,
+  apiKeys: [],
+  // Token shown once after creating a key (or on "Revelar"); rendered in a
+  // prominent card so it can be copied into the extension's options.
+  apiKeyCreated: null,
   installPrompt: null,
   canInstall: false,
   installed: false,
@@ -511,6 +516,9 @@ function render() {
           <button class="btn btn-ghost" id="btnImport" title="Importar senhas do Google Chrome">
             <span>📥</span> <span class="hide-mobile">Importar</span>
           </button>
+          <button class="btn btn-ghost" id="btnApiKeys" title="Gerenciar chaves de API (extensão do navegador e integrações)">
+            <span>🗝️</span> <span class="hide-mobile">Chaves de API</span>
+          </button>
           <button class="btn btn-ghost" id="btnGenerator" title="Gerar uma senha forte">
             <span>🎲</span> <span class="hide-mobile">Gerador</span>
           </button>
@@ -570,6 +578,7 @@ function render() {
     ${state.generatorModalOpen ? renderGeneratorModal() : ""}
     ${state.securityModalOpen ? renderSecurityModal() : ""}
     ${state.usersModalOpen ? renderUsersModal() : ""}
+    ${state.apiKeysModalOpen ? renderApiKeysModal() : ""}
   `;
 
   attachEvents();
@@ -1148,6 +1157,92 @@ function renderUsersModal() {
   `;
 }
 
+// API key management for the browser extension and other integrations. These
+// routes are authenticated by the panel session; the plaintext token is shown
+// once on create and can be revealed again only by its owner.
+function renderApiKeysModal() {
+  const created = state.apiKeyCreated;
+  const rows = state.apiKeys.map((k) => {
+    const perms = Object.entries(k.permissions || {}).filter(([, on]) => on).map(([p]) => p);
+    return `
+      <div class="user-row" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--border-subtle);">
+        <div style="flex:1;min-width:180px;">
+          <div style="font-weight:600;font-size:14px;">${escapeHTML(k.name)}</div>
+          ${k.description ? `<div style="font-size:12px;color:var(--text-muted);">${escapeHTML(k.description)}</div>` : ""}
+          <div style="font-size:11px;color:var(--text-muted);font-family:monospace;">${escapeHTML(k.key_prefix)}…${escapeHTML(k.key_suffix)}</div>
+        </div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap;">
+          ${perms.map((p) => `<span class="pill-badge" style="padding:2px 8px;border-radius:99px;font-size:11px;background:var(--bg-tertiary,#eee);color:var(--text-muted);">${escapeHTML(p)}</span>`).join("")}
+        </div>
+        <span style="font-size:11px;color:${k.is_active ? "var(--success,#2ecc71)" : "var(--danger,#e74c3c)"};">${k.is_active ? "ativa" : "revogada"}</span>
+        <span style="font-size:11px;color:var(--text-muted);">${k.last_used_at ? `usada em ${new Date(k.last_used_at).toLocaleDateString("pt-BR")}` : "nunca usada"}</span>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 8px;" data-key-reveal="${k.id}">Revelar</button>
+          <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 8px;" data-key-revoke="${k.id}" ${k.is_active ? "" : "disabled"}>Revogar</button>
+          <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 8px;color:var(--danger);" data-key-delete="${k.id}">Excluir</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <div class="modal-overlay" id="apiKeysModalBackdrop">
+      <div class="modal-content" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3 class="modal-title">Chaves de API</h3>
+          <button class="icon-btn" id="apiKeysModalClose">✕</button>
+        </div>
+
+        <div class="modal-body">
+          ${created ? `
+            <div class="recovery-key-card" style="margin-bottom:12px;">
+              <div style="flex:1;">
+                <strong style="font-size:13px;">Chave "${escapeHTML(created.name)}" (visível só agora):</strong>
+                <div class="recovery-key-text">${escapeHTML(created.token)}</div>
+              </div>
+              <button class="btn btn-ghost btn-icon" data-key-copy-created title="Copiar chave">📋</button>
+              <button class="icon-btn" data-key-dismiss-created title="Dispensar">✕</button>
+            </div>
+          ` : ""}
+
+          <section style="display:flex;flex-direction:column;gap:12px;">
+            <h4 style="font-size:15px;font-weight:700;">➕ Nova chave de API</h4>
+            <form id="createKeyForm" style="display:flex;flex-direction:column;gap:10px;">
+              <div class="form-group">
+                <label class="form-label">Nome</label>
+                <input class="form-input" name="name" placeholder="Ex.: Extensão do navegador" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Descrição (opcional)</label>
+                <input class="form-input" name="description" placeholder="Para que esta chave é usada" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Permissões</label>
+                <label style="display:flex;gap:8px;align-items:center;font-size:13px;"><input type="checkbox" name="perm_entries_read" checked /> entries:read — ler os itens do cofre</label>
+                <label style="display:flex;gap:8px;align-items:center;font-size:13px;"><input type="checkbox" name="perm_entries_write" checked /> entries:write — salvar e atualizar logins</label>
+                <label style="display:flex;gap:8px;align-items:center;font-size:13px;"><input type="checkbox" name="perm_vaults_read" /> vaults:read — listar cofres</label>
+              </div>
+              <button class="btn btn-primary" type="submit">Criar chave</button>
+              <p style="font-size:12px;color:var(--text-muted);margin:0;">Para a extensão do navegador, mantenha as duas primeiras permissões marcadas. Depois de criar, cole a chave nas Opções da extensão.</p>
+            </form>
+          </section>
+
+          <hr style="border:none;border-top:1px solid var(--border-subtle);margin:8px 0;" />
+
+          <section>
+            <h4 style="font-size:15px;font-weight:700;margin-bottom:6px;">🔑 Chaves (${state.apiKeys.length})</h4>
+            ${state.apiKeys.length === 0 ? `<p style="font-size:13px;color:var(--text-muted);">Nenhuma chave criada ainda.</p>` : rows}
+          </section>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" id="apiKeysModalCancel">Fechar</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 // Password generator, mirroring Bitwarden's: length, character classes and an
 // "avoid ambiguous characters" switch, with a live entropy estimate.
 function renderGeneratorModal() {
@@ -1408,6 +1503,12 @@ function closeTopModal() {
     render();
     return true;
   }
+  if (state.apiKeysModalOpen) {
+    state.apiKeysModalOpen = false;
+    state.apiKeyCreated = null;
+    render();
+    return true;
+  }
   return false;
 }
 
@@ -1530,6 +1631,9 @@ function attachEvents() {
     state.user = null;
     state.users = [];
     state.usersModalOpen = false;
+    state.apiKeysModalOpen = false;
+    state.apiKeys = [];
+    state.apiKeyCreated = null;
     state.chromeImportModalOpen = false;
     state.chromeImportResult = null;
     state.totp = {};
@@ -1649,6 +1753,17 @@ function attachEvents() {
     } catch (err) {
       console.error(err);
     }
+  });
+
+  document.querySelector("#btnApiKeys")?.addEventListener("click", async () => {
+    try {
+      state.apiKeys = (await api("/api/admin/keys")).data || [];
+    } catch (err) {
+      state.apiKeys = [];
+      alert("Não foi possível carregar as chaves de API: " + err.message);
+    }
+    state.apiKeysModalOpen = true;
+    render();
   });
 
   // Search and category filters repaint only the result list, so the open modal
@@ -1944,6 +2059,105 @@ function attachEvents() {
           state.users = (await api("/api/admin/users")).data || [];
           render();
           showToast("Conta excluída.");
+        } catch (err) {
+          alert("Erro ao excluir: " + err.message);
+        }
+      });
+    });
+  }
+
+  // API Keys Modal events (per-user keys for the extension and integrations)
+  if (state.apiKeysModalOpen) {
+    const reloadKeys = async () => {
+      try {
+        state.apiKeys = (await api("/api/admin/keys")).data || [];
+      } catch {
+        state.apiKeys = [];
+      }
+    };
+    const closeKeys = () => {
+      state.apiKeysModalOpen = false;
+      state.apiKeyCreated = null;
+      render();
+    };
+    document.querySelector("#apiKeysModalClose")?.addEventListener("click", closeKeys);
+    document.querySelector("#apiKeysModalCancel")?.addEventListener("click", closeKeys);
+    bindOverlayClose("#apiKeysModalBackdrop", closeKeys);
+
+    document.querySelector("#createKeyForm")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const data = new FormData(e.currentTarget);
+      const permissions = {
+        "entries:read": !!data.get("perm_entries_read"),
+        "entries:write": !!data.get("perm_entries_write"),
+        "vaults:read": !!data.get("perm_vaults_read"),
+      };
+      try {
+        const res = await api("/api/admin/keys", {
+          method: "POST",
+          body: JSON.stringify({
+            name: data.get("name"),
+            description: data.get("description") || "",
+            permissions,
+          }),
+        });
+        state.apiKeyCreated = res;
+        await reloadKeys();
+        render();
+        copyText(res.token, null, "Chave criada e copiada! Agora cole nas Opções da extensão.");
+      } catch (err) {
+        alert("Erro ao criar a chave: " + err.message);
+      }
+    });
+
+    document.querySelector("[data-key-copy-created]")?.addEventListener("click", () => {
+      if (state.apiKeyCreated) copyText(state.apiKeyCreated.token, null, "Chave copiada!");
+    });
+    document.querySelector("[data-key-dismiss-created]")?.addEventListener("click", () => {
+      state.apiKeyCreated = null;
+      render();
+    });
+
+    document.querySelectorAll("[data-key-reveal]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        const id = e.currentTarget.dataset.keyReveal;
+        try {
+          const res = await api(`/api/admin/keys/${id}/reveal`);
+          state.apiKeyCreated = {
+            name: state.apiKeys.find((k) => k.id === id)?.name || "chave",
+            token: res.token,
+          };
+          render();
+        } catch (err) {
+          alert("Erro ao revelar a chave: " + err.message);
+        }
+      });
+    });
+
+    document.querySelectorAll("[data-key-revoke]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        const id = e.currentTarget.dataset.keyRevoke;
+        if (!confirm("Revogar esta chave? Quem está usando ela deixa de funcionar imediatamente.")) return;
+        try {
+          await api(`/api/admin/keys/${id}/revoke`, { method: "PATCH", body: "{}" });
+          await reloadKeys();
+          render();
+          showToast("Chave revogada.");
+        } catch (err) {
+          alert("Erro ao revogar: " + err.message);
+        }
+      });
+    });
+
+    document.querySelectorAll("[data-key-delete]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        const id = e.currentTarget.dataset.keyDelete;
+        if (!confirm("Excluir esta chave permanentemente?")) return;
+        try {
+          await api(`/api/admin/keys/${id}`, { method: "DELETE" });
+          await reloadKeys();
+          render();
+          showToast("Chave excluída.");
         } catch (err) {
           alert("Erro ao excluir: " + err.message);
         }
