@@ -14,6 +14,7 @@ import (
 	"github.com/openpass/api/internal/apikeys"
 	"github.com/openpass/api/internal/audit"
 	"github.com/openpass/api/internal/backup"
+	"github.com/openpass/api/internal/bitwarden"
 	"github.com/openpass/api/internal/config"
 	opdb "github.com/openpass/api/internal/db"
 	"github.com/openpass/api/internal/httpjson"
@@ -40,6 +41,11 @@ func main() {
 	}
 
 	adminSvc := admin.New(database, cfg.AdminPassword, cfg.SecretKey)
+	bwSvc := bitwarden.New(database, cfg.BitwardenDomain)
+	// The Bitwarden-compatible layer derives its master-password keys from
+	// the panel password at account creation/reset time; it must be wired
+	// before Bootstrap creates the first admin.
+	adminSvc.SetBitwardenProvisioner(bwSvc.ProvisionUser)
 	if err := adminSvc.Bootstrap(cfg.AdminEmail); err != nil {
 		log.Fatalf("failed to bootstrap first admin: %v", err)
 	}
@@ -65,6 +71,7 @@ func main() {
 	vaultSvc.RegisterAdminRoutes(mux, adminSvc.Require)
 	vaultSvc.RegisterAPIRoutes(mux, keySvc)
 	registerBackupRoutes(mux, backupSvc, keySvc)
+	bwSvc.RegisterRoutes(mux)
 	mux.Handle("/", web.Handler())
 
 	server := &http.Server{

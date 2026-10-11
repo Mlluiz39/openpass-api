@@ -67,6 +67,21 @@ type Service struct {
 	// reset; the database is the source of truth afterwards.
 	configuredPassword string
 	sessionTTL         time.Duration
+	// bwProvision initializes the Bitwarden-compatible vault keys for an
+	// account whose panel password is momentarily known in plaintext.
+	// Wired at startup by main; nil disables the integration.
+	bwProvision BitwardenProvisioner
+}
+
+// BitwardenProvisioner creates (or refreshes) the Bitwarden API key
+// material for userID from a plaintext password. See
+// bitwarden.Service.ProvisionUser for the exact semantics.
+type BitwardenProvisioner func(ctx context.Context, userID, password string) error
+
+// SetBitwardenProvisioner plugs the Bitwarden compatibility layer into the
+// account lifecycle (create / reset / change password).
+func (s *Service) SetBitwardenProvisioner(provision BitwardenProvisioner) {
+	s.bwProvision = provision
 }
 
 func New(database *sql.DB, adminPassword string, secretKey ...string) *Service {
@@ -132,7 +147,15 @@ func (s *Service) ResetPassword() error {
 		return err
 	}
 	_, err = s.db.Exec(`DELETE FROM sessions WHERE user_id = $1`, id)
-	return err
+	if err != nil {
+		return err
+	}
+	// Refresh the Bitwarden master-password keys with the reset password
+	// (no-op once the account has logged in from a Bitwarden client).
+	if s.bwProvision != nil {
+		return s.bwProvision(context.Background(), id, s.configuredPassword)
+	}
+	return nil
 }
 
 func (s *Service) RegisterRoutes(mux *http.ServeMux) {
@@ -209,6 +232,17 @@ func (s *Service) createAccount(ctx context.Context, input createAccountInput) (
 	if input.WithRecovery {
 		if _, err := s.generateAndSaveRecoveryKey(ctx, id); err != nil {
 			return "", err
+		}
+	}
+	if s.bwProvision != nil {
+		// The panel password is about to be shown (bootstrap value or the
+		// one-time temporary password), so this is the moment to derive the
+		// account's Bitwarden master-password keys from it. If provisioning
+		// fails the account is rolled back, so an admin never hands out a
+		// password that cannot open the Bitwarden clients.
+		if err := s.bwProvision(ctx, id, input.Password); err != nil {
+			_, _ = s.db.ExecContext(ctx, `DELETE FROM users WHERE id = $1`, id)
+			return "", fmt.Errorf("provisionamento do cofre Bitwarden falhou: %w", err)
 		}
 	}
 	return id, nil
@@ -545,7 +579,16 @@ func (s *Service) setNewPassword(ctx context.Context, userID, newPassword string
 		`UPDATE users SET password_hash = $1, must_change_password = 0, updated_at = $2 WHERE id = $3`,
 		hash, time.Now().UTC().Format(time.RFC3339), userID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	// Best effort: the Bitwarden master-password keys follow the new panel
+	// password, but only while the account has never been used from a
+	// Bitwarden client (after that its vault would become undecryptable).
+	if s.bwProvision != nil {
+		_ = s.bwProvision(ctx, userID, newPassword)
+	}
+	return nil
 }
 
 // Require resolves the session cookie into a CurrentUser and rejects anything

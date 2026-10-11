@@ -18,6 +18,9 @@ type Config struct {
 	AdminPassword          string
 	GeneratedAdminPassword bool
 	ResetAdminPassword     bool
+	// BitwardenDomain pins the public URL reported by the Bitwarden-
+	// compatible API (/api/config, JWT issuer). Empty = derive per request.
+	BitwardenDomain string
 }
 
 func Load() (Config, error) {
@@ -27,6 +30,8 @@ func Load() (Config, error) {
 		SecretFile:  envOr("OPENPASS_SECRET_FILE", filepath.Join("data", "openpass.secret")),
 		SecretKey:   strings.TrimSpace(os.Getenv("OPENPASS_SECRET_KEY")),
 		AdminEmail:  envOr("OPENPASS_ADMIN_EMAIL", "admin@openpass.local"),
+
+		BitwardenDomain: strings.TrimSpace(os.Getenv("OPENPASS_BW_DOMAIN")),
 	}
 
 	if cfg.SecretKey == "" {

@@ -11,6 +11,9 @@ automations.
   manages accounts but cannot read other users' vault data.
 - Secrets and API key tokens are encrypted at rest (AES-GCM with the app
   secret). Passwords are hashed with argon2id.
+- **Bitwarden-compatible API**: official Bitwarden clients (browser/mobile/
+  desktop/CLI) can log in and sync a zero-knowledge vault against this
+  server — see [Bitwarden-compatible API](#bitwarden-compatible-api).
 - External callers authenticate with `Authorization: Bearer op_live_...`.
 
 ## Quick start (Docker Compose — recommended)
@@ -230,6 +233,65 @@ External API key usage (Bearer, scoped to the key owner):
 - `POST /api/v1/entries`, `PUT /api/v1/entries/{id}`, `DELETE /api/v1/entries/{id}`
 - `POST /api/v1/backup/create`, `POST /api/v1/backup/restore`
 
+## Bitwarden-compatible API
+
+OpenPass also implements the official Bitwarden HTTP API (same wire format as
+Vaultwarden), so **official Bitwarden clients** — browser extensions, mobile
+and desktop apps, and the CLI — can log in against this server and sync their
+vaults. Data stays **zero-knowledge**: clients encrypt everything locally
+(AES-256-CBC + HMAC, keys derived from the master password) and the server
+only stores CipherStrings it cannot read.
+
+Enable it by pointing a client at this server:
+
+1. Self-hosted Bitwarden clients: set the custom server URL to
+   `https://your-domain` (the API lives under `/api` and `/identity`).
+2. Log in with the account e-mail and the account's **Bitwarden master
+   password** (see below). New accounts get one automatically.
+
+Notes:
+
+- **Master password lifecycle.** When an account is created (or its panel
+  password is reset) the server derives the Bitwarden key material from that
+  one-time plaintext, exactly as a client would — so the temporary password
+  works both in the panel and in Bitwarden clients. Afterwards the master
+  password only changes through the Bitwarden clients themselves
+  (`POST /api/accounts/password`), which re-encrypt the whole vault
+  client-side. The panel password and the Bitwarden master password are
+  independent secrets after that.
+- **Supported (core scope):** identity login with refresh tokens and 2FA
+  (authenticator TOTP + "remember this device"), `GET /api/sync`, cipher CRUD
+  (login/note/card/identity, folders, favorites, trash, import, bulk
+  restore/delete), per-account KDF settings (PBKDF2 600k or Argon2id),
+  profile/keys endpoints, equivalent domains, JWKS/OIDC discovery and the
+  TOTP sentinel endpoint `/api/ciphers/3lzaazFjuUJ6LbiC`.
+- **Not implemented yet:** organizations/sharing, Bitwarden Send, emergency
+  access, attachments, passkey (FIDO2) logins and HIBP breach checks (a
+  manual-check stub is returned instead).
+- `OPENPASS_BW_DOMAIN` (optional) pins the public base URL reported by
+  `/api/config` and used as the JWT issuer; otherwise it is derived from the
+  request (honouring `X-Forwarded-Proto`).
+
+Main routes:
+
+- `GET /api/config`, `GET /identity/.well-known/openid-configuration`,
+  `GET /identity/keys`
+- `POST /identity/connect/token` (password / refresh_token grants),
+  `POST /identity/accounts/prelogin`
+- `GET /api/sync`, `GET /api/accounts/profile`, `GET /api/accounts/revision-date`
+- `GET/POST /api/ciphers`, `GET/PUT/DELETE /api/ciphers/{id}`,
+  `POST /api/ciphers/{id}/delete`, `POST /api/ciphers/{id}/restore`,
+  `PUT /api/ciphers/{id}/favorite`, `PUT /api/ciphers/{id}/partial`,
+  bulk `DELETE|POST|PUT /api/ciphers(s)/delete|restore`,
+  `POST /api/ciphers/import`, `POST /api/trash/empty`
+- `GET/POST /api/folders`, `GET/PUT/DELETE /api/folders/{id}`
+- `POST /api/accounts/password`, `POST /api/accounts/verify-password`,
+  `GET /api/accounts/keys`
+- `GET /api/settings/two-factor`, `POST /api/settings/two-factor/authenticator`,
+  `.../authenticator/confirm`, `POST /api/settings/two-factor/disable`
+- `GET /api/devices`, `GET /api/devices/identifier/{id}`,
+  `GET /api/devices/knowndevice`
+
 ## Encrypted backups
 
 The panel has a Backup tab for `.opbackup` files. Backups are **per user**:
@@ -261,6 +323,7 @@ password if one was used.
 | `OPENPASS_ADMIN_PASSWORD_RESET` | unset | `1` = overwrite first admin's password, kill their sessions |
 | `OPENPASS_SECRET_KEY` | from `OPENPASS_SECRET_FILE` | app encryption key (keep stable!) |
 | `OPENPASS_SECRET_FILE` | `data/openpass.secret` | where the app key is created/stored |
+| `OPENPASS_BW_DOMAIN` | derived from the request | public base URL for the Bitwarden-compatible API (config + JWT issuer) |
 | `POSTGRES_PASSWORD` | — | database password for compose |
 | `POSTGRES_PORT` | `5432` | host port mapped to the db container |
 | `OPENPASS_PORT` | `8080` | host port mapped to the app |

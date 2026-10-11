@@ -243,6 +243,11 @@ func (s *Service) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	if (body.Status != nil && *body.Status == "disabled") || body.ResetPassword {
 		_, _ = s.db.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = $1`, target.ID)
 	}
+	if temporary != "" && s.bwProvision != nil {
+		// Same lifecycle as createAccount: the one-time temporary password
+		// also becomes (or refreshes) the Bitwarden master password.
+		_ = s.bwProvision(ctx, target.ID, temporary)
+	}
 
 	view, err := s.getUserView(ctx, target.ID)
 	if err != nil {
