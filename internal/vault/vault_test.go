@@ -86,7 +86,7 @@ func TestUsersCannotTouchEachOthersData(t *testing.T) {
 	if _, err := service.getEntry(context.Background(), bob, entry.ID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("getEntry(bob) err = %v, want sql.ErrNoRows", err)
 	}
-	if err := service.UpdateVault(context.Background(), bob, v.ID, VaultInput{Name: "hijack"}); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := service.UpdateVault(context.Background(), bob, v.ID, VaultInput{Name: "hijack"}); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("UpdateVault(bob) err = %v, want sql.ErrNoRows", err)
 	}
 	if err := service.DeleteEntry(context.Background(), bob, entry.ID); !errors.Is(err, sql.ErrNoRows) {
