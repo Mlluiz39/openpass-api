@@ -27,7 +27,7 @@ para o **seu** servidor.
 2. Abra `chrome://extensions`, ative o **Modo do desenvolvedor**.
 3. Clique em **Carregar sem compactação** e selecione esta pasta (`extension/`).
 4. Abra as **Opções** da extensão e informe:
-   - **URL do servidor**: ex. `https://openpass.mlluizdevtech.qzz.io`
+   - **URL do servidor**: ex. `https://openpass.mlluizdevtech.com.br`
    - **Chave de API**: o valor gerado no passo 1.
 5. Clique em **Testar conexão** — deve responder quantos cofres a chave vê.
 

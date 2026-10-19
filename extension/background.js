@@ -5,7 +5,7 @@
 // for the entries that match its own origin.
 
 const DEFAULTS = {
-  serverUrl: "https://openpass.mlluizdevtech.qzz.io",
+  serverUrl: "https://openpass.mlluizdevtech.com.br",
   apiKey: "",
   autoFillOnLoad: true,
   askToSave: true,

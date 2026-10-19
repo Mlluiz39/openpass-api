@@ -4,7 +4,7 @@
 // ever sent to the server URL configured here.
 
 const DEFAULTS = {
-  serverUrl: "https://openpass.mlluizdevtech.qzz.io",
+  serverUrl: "https://openpass.mlluizdevtech.com.br",
   apiKey: "",
   autoFillOnLoad: true,
   askToSave: true,
